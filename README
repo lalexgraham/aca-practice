@@ -1,3 +1,8 @@
+## docker commands 
 docker build --platform linux/amd64 -t aca-practice .
-docker run --platform linux/amd64 - -p 8000:8000 aca-practice
+docker run --platform linux/amd64 -p 8000:8000 aca-practice
 # check http://localhost:8000
+
+
+
+
