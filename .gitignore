@@ -6,5 +6,5 @@ __pycache__/
 db.sqlite3
 .DS_Store
 *.md
-terraform/backend.hcl
-terraform/steup-terraform-oidc.sh
+infra/backend.hcl
+infra/.terraform/
