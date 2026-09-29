@@ -9,10 +9,10 @@ permissions:
   contents: read
 
 env:
-  ACR_NAME: acapracticeacr
+  ACR_NAME: acrinspireapp1dev
   IMAGE_NAME: aca-practice
-  RESOURCE_GROUP: rg-aca-practice
-  CONTAINER_APP: aca-practice-app
+  RESOURCE_GROUP: rg-inspire-app1-dev
+  CONTAINER_APP: ca-inspire-app1-dev
 
 jobs:
   build-and-deploy:
