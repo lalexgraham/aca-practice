@@ -31,6 +31,7 @@ echo "Creating service principal..."
 az ad sp create --id "$APP_ID" >/dev/null
 
 APPLY_SUBJECT="repo:${GITHUB_USERNAME}@${OWNER_ID}/${REPO_NAME}@${REPO_ID}:ref:refs/heads/main"
+APPLY_ENV_SUBJECT="repo:${GITHUB_USERNAME}@${OWNER_ID}/${REPO_NAME}@${REPO_ID}:environment:infra-apply"
 PLAN_SUBJECT="repo:${GITHUB_USERNAME}@${OWNER_ID}/${REPO_NAME}@${REPO_ID}:pull_request"
 
 echo "Creating federated credential for terraform-apply.yml (push to main)..."
@@ -40,6 +41,20 @@ az ad app federated-credential create \
     \"name\": \"github-tf-apply-main\",
     \"issuer\": \"https://token.actions.githubusercontent.com\",
     \"subject\": \"${APPLY_SUBJECT}\",
+    \"audiences\": [\"api://AzureADTokenExchange\"]
+  }"
+
+echo "Creating federated credential for terraform-apply.yml (infra-apply environment)..."
+# terraform-apply.yml's job sets `environment: infra-apply`, which changes
+# the OIDC subject GitHub issues from ref:refs/heads/main to
+# environment:infra-apply. Both credentials are needed: this one for the
+# environment-scoped subject, the ref one above is harmless to keep.
+az ad app federated-credential create \
+  --id "$APP_ID" \
+  --parameters "{
+    \"name\": \"github-tf-apply-env-infra-apply\",
+    \"issuer\": \"https://token.actions.githubusercontent.com\",
+    \"subject\": \"${APPLY_ENV_SUBJECT}\",
     \"audiences\": [\"api://AzureADTokenExchange\"]
   }"
 

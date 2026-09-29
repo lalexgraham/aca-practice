@@ -23,6 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Debug secret presence (temporary)
+        run: |
+          echo "client-id set: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM != '' }}"
+          echo "tenant-id set: ${{ secrets.AZURE_TENANT_ID != '' }}"
+          echo "subscription-id set: ${{ secrets.AZURE_SUBSCRIPTION_ID != '' }}"
+
       - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM }}
