@@ -1,0 +1,10 @@
+# Copy to backend.hcl (gitignored) and fill in real values for local runs:
+#   terraform init -backend-config=backend.hcl
+#
+# In CI these same four values come from repo/environment variables,
+# not secrets. They're a container name, not credentials.
+
+resource_group_name  = "rg-tfstate"
+storage_account_name = "sttfstateinspire<unique-suffix>"
+container_name       = "tfstate"
+key                  = "phase1.tfstate"
