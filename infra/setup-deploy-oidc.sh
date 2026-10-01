@@ -21,8 +21,13 @@
 #      repo and branch". This is what lets deploy.yml authenticate with
 #      no stored password/secret - GitHub mints a short-lived token per
 #      run, Azure checks it against this rule instead of a stored secret.
+#   5. Grants AcrPush on the ACR and Container Apps Contributor on the
+#      container app (skipped with a reminder if Terraform hasn't created
+#      them yet).
+#   6. Sets the AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID
+#      GitHub repo secrets used by deploy.yml.
 #
-# Run from anywhere, requires: az login already done, curl.
+# Run from anywhere, requires: az login and gh auth login already done, curl.
 
 set -euo pipefail
 
@@ -72,31 +77,84 @@ az ad app federated-credential create \
     \"audiences\": [\"api://AzureADTokenExchange\"]
   }"
 
+echo "Done creating app registration and federated credential. Granting roles and setting GitHub secrets..."
+
+SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+TENANT_ID=$(az account show --query tenantId -o tsv)
+
+# Use the SP object ID + principal type so role assignments don't fail
+# while the new service principal is still replicating in Entra.
+SP_OBJECT_ID=$(az ad sp show --id "$APP_ID" --query id -o tsv)
+
+# Just enough RBAC for what deploy.yml actually does - push an image and
+# update the running revision - rather than a blanket Contributor grant.
+# Both resources are created by Terraform, so skip with a reminder if this
+# runs before the first terraform apply.
+echo "Granting AcrPush on the ACR..."
+if ACR_ID=$(az acr show -n "$ACR_NAME" -g "$RESOURCE_GROUP" --query id -o tsv 2>/dev/null); then
+  az role assignment create \
+    --assignee-object-id "$SP_OBJECT_ID" \
+    --assignee-principal-type ServicePrincipal \
+    --role AcrPush \
+    --scope "$ACR_ID"
+else
+  echo "   ACR ${ACR_NAME} doesn't exist yet. After the first terraform apply, run:"
+  echo "   az role assignment create --assignee-object-id $SP_OBJECT_ID --assignee-principal-type ServicePrincipal --role AcrPush --scope \"\$(az acr show -n $ACR_NAME -g $RESOURCE_GROUP --query id -o tsv)\""
+fi
+
+echo "Granting Container Apps Contributor on the container app..."
+if CONTAINER_APP_ID=$(az containerapp show -n "$CONTAINER_APP_NAME" -g "$RESOURCE_GROUP" --query id -o tsv 2>/dev/null); then
+  az role assignment create \
+    --assignee-object-id "$SP_OBJECT_ID" \
+    --assignee-principal-type ServicePrincipal \
+    --role "Container Apps Contributor" \
+    --scope "$CONTAINER_APP_ID"
+else
+  echo "   Container app ${CONTAINER_APP_NAME} doesn't exist yet. After the first terraform apply, run:"
+  echo "   az role assignment create --assignee-object-id $SP_OBJECT_ID --assignee-principal-type ServicePrincipal --role \"Container Apps Contributor\" --scope \"\$(az containerapp show -n $CONTAINER_APP_NAME -g $RESOURCE_GROUP --query id -o tsv)\""
+fi
+
+# AZURE_CLIENT_ID is a *different* secret to AZURE_CLIENT_ID_TERRAFORM -
+# deploy.yml and the Terraform workflows each authenticate as their own app
+# registration. Tenant and subscription are shared by both, setting them
+# again is harmless (gh overwrites with the same value).
+echo "Setting AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID GitHub secrets..."
+gh secret set AZURE_CLIENT_ID --repo "${GITHUB_USERNAME}/${REPO_NAME}" --body "$APP_ID"
+gh secret set AZURE_TENANT_ID --repo "${GITHUB_USERNAME}/${REPO_NAME}" --body "$TENANT_ID"
+gh secret set AZURE_SUBSCRIPTION_ID --repo "${GITHUB_USERNAME}/${REPO_NAME}" --body "$SUBSCRIPTION_ID"
+
 echo ""
-echo "Done. Next steps (not automated by this script, deliberately, since they're one-time and worth doing by hand):"
-echo "  1. Grant just enough RBAC to do what deploy.yml actually does - push an image"
-echo "     and update the running revision - rather than a blanket Contributor grant:"
-echo "     az role assignment create --assignee $APP_ID --role AcrPush --scope \"\$(az acr show -n $ACR_NAME -g $RESOURCE_GROUP --query id -o tsv)\""
-echo "     az role assignment create --assignee $APP_ID --role \"Container Apps Contributor\" --scope \"\$(az containerapp show -n $CONTAINER_APP_NAME -g $RESOURCE_GROUP --query id -o tsv)\""
-echo "  2. Add AZURE_CLIENT_ID = $APP_ID as a GitHub repo secret (this is a *different*"
-echo "     secret to AZURE_CLIENT_ID_TERRAFORM - deploy.yml and the Terraform workflows"
-echo "     each authenticate as their own app registration)."
-echo "  3. AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID should already exist as repo secrets"
-echo "     (same tenant/subscription as the Terraform app) - confirm under Settings >"
-echo "     Secrets and variables > Actions rather than assuming, add them if missing."
-echo ""
+echo "Done."
 
 # UNDO
 # # get the appId if you don't have it noted
-# APP_ID=$(az ad app list --display-name "$APP_DISPLAY_NAME" --query "[0].appId" -o tsv)
-#
-# # remove the scoped role assignments explicitly first
-# # (deleting the app orphans these rather than reliably cleaning them up)
-# az role assignment delete --assignee "$APP_ID" --role AcrPush \
+# APP_ID=$(az ad app list --display-name "github-aca-practice-deploy" --query "[0].appId" -o tsv)
+
+# # remove the scoped role assignments first, while the SP still exists to
+# # resolve them (deleting the app orphans these rather than reliably
+# # cleaning them up). Only needed if the ACR / container app still exist -
+# # terraform destroy removes their role assignments with them.
+# az role assignment delete \
+#   --assignee "$APP_ID" \
+#   --role AcrPush \
 #   --scope "$(az acr show -n acrinspireapp1dev -g rg-inspire-app1-dev --query id -o tsv)"
-# az role assignment delete --assignee "$APP_ID" --role "Container Apps Contributor" \
+
+# az role assignment delete \
+#   --assignee "$APP_ID" \
+#   --role "Container Apps Contributor" \
 #   --scope "$(az containerapp show -n ca-inspire-app1-dev -g rg-inspire-app1-dev --query id -o tsv)"
-#
+
+# # confirm nothing is left (should print an empty table)
+# az role assignment list --assignee "$APP_ID" --all -o table
+
 # # this removes the app registration, its service principal, and the
 # # federated credential in one go
 # az ad app delete --id "$APP_ID"
+
+# # remove the GitHub secret that pointed at the deleted app
+# gh secret delete AZURE_CLIENT_ID --repo lalexgraham/aca-practice
+
+# # AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID are shared with the Terraform
+# # workflows - only delete these if you're also undoing setup-terraform-oidc.sh
+# gh secret delete AZURE_TENANT_ID --repo lalexgraham/aca-practice
+# gh secret delete AZURE_SUBSCRIPTION_ID --repo lalexgraham/aca-practice

@@ -1,7 +1,34 @@
 #!/usr/bin/env zsh
-# Creates the Terraform-specific Entra app registration and its two
-# federated credentials (plan on PR, apply on push to main).
-# Run from anywhere, requires: az login already done, curl.
+# Creates the Terraform-specific Entra app registration and its three
+# federated credentials (1 for plan on PR, 2 for apply on push to main).
+#
+# What this script does, in order:
+#   1. Looks up your GitHub owner/repo IDs (needed for the federated
+#      credentials' subjects, which use GitHub's immutable @<id> format).
+#   2. Creates an Entra "app registration": an identity Azure AD can
+#      recognise, roughly analogous to a service account.
+#   3. Creates a "service principal" for that app: the actual security
+#      principal Azure RBAC grants roles to (the app registration and the
+#      service principal are two different objects; you need both).
+#   4. Creates three "federated credentials" on the app: trust rules that
+#      say "accept OIDC tokens from GitHub Actions, but only for this exact
+#      repo and trigger". One for terraform-plan.yml on pull requests, and
+#      two for terraform-apply.yml (push to main, and the infra-apply
+#      environment). No stored password/secret - GitHub mints a short-lived
+#      token per run, Azure checks it against these rules instead.
+#   5. Grants Contributor at subscription scope, since Terraform creates the
+#      resource group itself and so needs rights above it.
+#   6. Grants Storage Blob Data Contributor on the tfstate storage account,
+#      so Terraform can read, write and lease-lock the state file.
+#   7. Sets the AZURE_CLIENT_ID_TERRAFORM GitHub repo secret used by the
+#      Terraform workflows (AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID are
+#      set by setup-deploy-oidc.sh).
+#   8. Grants User Access Administrator on the ACR, so Terraform can create
+#      the AcrPull role assignment (azurerm_role_assignment.acr_pull in
+#      main.tf). Skipped with a reminder if the ACR doesn't exist yet, which
+#      it won't until the first terraform apply.
+#
+# Run from anywhere, requires: az login and gh auth login already done, curl.
 
 set -euo pipefail
 
@@ -9,6 +36,14 @@ set -euo pipefail
 GITHUB_USERNAME="lalexgraham"
 REPO_NAME="aca-practice"
 APP_DISPLAY_NAME="github-aca-practice-terraform"
+
+TF_ENVIRONMENT="dev"                      # must match -var="environment=..."
+TFSTATE_RG="rg-tfstate"
+TFSTATE_SA="tfstate19271"
+PROJECT="inspire-app1"                    # must match var.project default
+APP_RG="rg-${PROJECT}-${TF_ENVIRONMENT}"
+ACR_NAME="acr${PROJECT//-/}${TF_ENVIRONMENT}"
+
 # -------------------------
 
 echo "Fetching GitHub owner and repo IDs (public API, no auth needed)..."
@@ -68,32 +103,82 @@ az ad app federated-credential create \
     \"audiences\": [\"api://AzureADTokenExchange\"]
   }"
 
+echo "Done creating app registration and federated credentials. Now grant the app registration the necessary roles on the subscription and storage account. And push secrets to GitHub"
+
+SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+# Use the SP object ID + principal type so role assignments don't fail
+# while the new service principal is still replicating in Entra.
+
+SP_OBJECT_ID=$(az ad sp show --id "$APP_ID" --query id -o tsv)
+
+echo "Granting Contributor at subscription scope..."
+
+az role assignment create \
+  --assignee-object-id "$SP_OBJECT_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role Contributor \
+  --scope "/subscriptions/${SUBSCRIPTION_ID}"
+
+echo "Granting Storage Blob Data Contributor on the tfstate storage account..."
+
+az role assignment create \
+  --assignee-object-id "$SP_OBJECT_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Storage Blob Data Contributor" \
+  --scope "$(az storage account show -g "$TFSTATE_RG" -n "$TFSTATE_SA" --query id -o tsv)"
+
+echo "Setting AZURE_CLIENT_ID_TERRAFORM GitHub secret..."
+
+gh secret set AZURE_CLIENT_ID_TERRAFORM \
+  --repo "${GITHUB_USERNAME}/${REPO_NAME}" \
+  --body "$APP_ID"
+
+# AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID are already set by the deploy pipeline setup.
+
+echo "Granting User Access Administrator on the ACR (for azurerm_role_assignment.acr_pull)..."
+
+if ACR_ID=$(az acr show -n "$ACR_NAME" -g "$APP_RG" --query id -o tsv 2>/dev/null); then
+  az role assignment create \
+    --assignee-object-id "$SP_OBJECT_ID" \
+    --assignee-principal-type ServicePrincipal \
+    --role "User Access Administrator" \
+    --scope "$ACR_ID"
+else
+  echo "   ACR ${ACR_NAME} doesn't exist yet. After the first terraform apply, run:"
+  echo "   az role assignment create --assignee-object-id $SP_OBJECT_ID --assignee-principal-type ServicePrincipal --role \"User Access Administrator\" --scope \"\$(az acr show -n $ACR_NAME -g $APP_RG --query id -o tsv)\""
+fi
+
 echo ""
-echo "Done. Next steps (not automated by this script, deliberately, since they're one-time and worth doing by hand):"
-echo "  1. Grant Contributor at subscription scope (Terraform creates the resource group itself):"
-echo "     az role assignment create --assignee $APP_ID --role Contributor --scope \"/subscriptions/\$(az account show --query id -o tsv)\""
-echo "  2. Add AZURE_CLIENT_ID_TERRAFORM = $APP_ID as a GitHub repo secret."
-echo "  3. AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID are already set from the deploy pipeline, no change needed."
-echo "  4. Grant User Access Administrator on the ACR so Terraform can create the AcrPull role assignment"
-echo "     (azurerm_role_assignment.acr_pull in main.tf). The ACR doesn't exist yet at this point, so this"
-echo "     can't be run until after the first terraform apply creates it - run it then, or if apply fails"
-echo "     with 'AuthorizationFailed ... roleAssignments/write':"
-echo "     az role assignment create --assignee $APP_ID --role \"User Access Administrator\" --scope \"\$(az acr show -n <acr-name> -g <resource-group> --query id -o tsv)\""
-echo ""
-echo "Granting Storage Blob Data Contributor role to the app registration for the tfstate storage account"
-echo "az role assignment create --assignee 9ee70454-efd4-45c0-85ed-305f146937b2 --role "Storage Blob Data Contributor" --scope "$(az storage account show -g rg-tfstate -n tfstate19271 --query id -o tsv)"
+echo "Done."
 
 # UNDO
 # # get the appId if you don't have it noted
 # APP_ID=$(az ad app list --display-name "github-aca-practice-terraform" --query "[0].appId" -o tsv)
+# SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
-# # remove the subscription-scope role assignment explicitly first
-# # (deleting the app orphans this rather than reliably cleaning it up)
+# # remove role assignments first, while the SP still exists to resolve them
+# # (deleting the app orphans these rather than reliably cleaning them up)
 # az role assignment delete \
 #   --assignee "$APP_ID" \
 #   --role Contributor \
-#   --scope "/subscriptions/$(az account show --query id -o tsv)"
+#   --scope "/subscriptions/${SUBSCRIPTION_ID}"
 
-# # this removes the app registration, its service principal, and both
+# az role assignment delete \
+#   --assignee "$APP_ID" \
+#   --role "Storage Blob Data Contributor" \
+#   --scope "$(az storage account show -g rg-tfstate -n tfstate19271 --query id -o tsv)"
+
+# # only needed if the ACR still exists (terraform destroy removes the ACR
+# # and its role assignments with it)
+# az role assignment delete \
+#   --assignee "$APP_ID" \
+#   --role "User Access Administrator" \
+#   --scope "$(az acr show -n acrinspireapp1dev -g rg-inspire-app1-dev --query id -o tsv)"
+
+# # this removes the app registration, its service principal, and all three
 # # federated credentials in one go
 # az ad app delete --id "$APP_ID"
+
+# # remove the GitHub secret that pointed at the deleted app
+# gh secret delete AZURE_CLIENT_ID_TERRAFORM --repo lalexgraham/aca-practice
