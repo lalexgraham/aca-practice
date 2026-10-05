@@ -35,7 +35,10 @@ resource "azurerm_container_app" "this" {
   name                         = "aca-app-${var.environment}"
   resource_group_name          = data.azurerm_resource_group.platform.name
   container_app_environment_id = data.azurerm_container_app_environment.platform.id
-  revision_mode                = "Single"
+  # Azure sets this on every app in a workload-profile environment. Left
+  # undeclared, Terraform plans to null it on every run (a permanent diff).
+  workload_profile_name = "Consumption"
+  revision_mode         = "Single"
 
   tags = {
     purpose = "pipeline-test"

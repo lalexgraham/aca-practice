@@ -343,6 +343,8 @@ Staging has no GitHub Environment at all, it applies and deploys automatically.
 
 `.github/workflows/terraform-plan.yml` runs on any pull request touching `infra/**`. It plans only the layers the PR changed (a change under `infra/platform` plans the platform, a change under `infra/environment` plans both staging and production) and posts each plan as a comment on the PR. Nothing is applied.
 
+The workflow runs on every pull request (not just ones touching `infra/`) because `main`'s branch protection requires its final job, named exactly `plan`. That job passes when all planned layers succeed, or when nothing needed planning. Without it, an app-only pull request would wait forever for a check that never reports.
+
 ### Github action: terraform apply on a push to main
 
 `.github/workflows/terraform-apply.yml` runs on a push to main touching `infra/**`:
