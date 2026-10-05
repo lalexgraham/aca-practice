@@ -19,7 +19,7 @@ from django.urls import path
 from django.http import HttpResponse
 
 def home(request):
-    return HttpResponse("Hello from Azure Container Apps, pipeline test 1")
+    return HttpResponse("Hello from Azure Container Apps, pipeline test 2")
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("", home),
