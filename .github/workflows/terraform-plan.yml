@@ -3,11 +3,16 @@
 # Plans whichever layers the PR touches and posts each plan as a PR comment.
 # Applies nothing. A change under infra/platform plans the platform layer,
 # a change under infra/environment plans both staging and production.
+#
+# Runs on every pull request, not just ones touching infra/**, so that the
+# `plan` job below always reports a status. main's branch protection requires
+# that one check, and a path-filtered workflow would never report it on an
+# app-only PR, leaving that PR unmergeable. The `changes` job decides what
+# (if anything) to plan.
 name: Terraform plan
 
 on:
   pull_request:
-    paths: ["infra/**"]
 
 permissions:
   id-token: write
@@ -50,7 +55,7 @@ jobs:
           matrix="[$(IFS=,; echo "${layers[*]}")]"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
-  plan:
+  plan-layer:
     needs: changes
     if: needs.changes.outputs.matrix != '[]'
     runs-on: ubuntu-latest
@@ -119,3 +124,18 @@ jobs:
           else
             gh api -X POST "repos/${{ github.repository }}/issues/${PR}/comments" -F body=@comment.md > /dev/null
           fi
+
+  # The one check main's branch protection requires (named exactly `plan`).
+  # Passes when every planned layer succeeded, or when nothing needed planning
+  # (an app-only PR). Fails if any plan failed or the change detection did.
+  plan:
+    needs: [changes, plan-layer]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          CHANGES: ${{ needs.changes.result }}
+          PLAN_LAYER: ${{ needs.plan-layer.result }}
+        run: |
+          echo "changes=$CHANGES plan-layer=$PLAN_LAYER"
+          [ "$CHANGES" = "success" ] && { [ "$PLAN_LAYER" = "success" ] || [ "$PLAN_LAYER" = "skipped" ]; }
