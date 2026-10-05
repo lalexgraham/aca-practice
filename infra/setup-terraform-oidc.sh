@@ -14,7 +14,9 @@
 #      say "accept OIDC tokens from GitHub Actions, but only for this exact
 #      repo and trigger". One for terraform-plan.yml on pull requests, and
 #      two for terraform-apply.yml (push to main, and the infra-apply
-#      environment). No stored password/secret - GitHub mints a short-lived
+#      environment). The production gate (infra-apply-production) needs no
+#      credential of its own: its approval job never logs in to Azure, and
+#      the apply job after it authenticates with the push-to-main subject. No stored password/secret - GitHub mints a short-lived
 #      token per run, Azure checks it against these rules instead.
 #   5. Grants Contributor at subscription scope, since Terraform creates the
 #      resource group itself and so needs rights above it.
@@ -24,9 +26,10 @@
 #      Terraform workflows (AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID are
 #      set by setup-deploy-oidc.sh).
 #   8. Grants User Access Administrator on the ACR, so Terraform can create
-#      the AcrPull role assignment (azurerm_role_assignment.acr_pull in
-#      main.tf). Skipped with a reminder if the ACR doesn't exist yet, which
-#      it won't until the first terraform apply.
+#      each environment's AcrPull role assignment
+#      (azurerm_role_assignment.acr_pull in environment/main.tf). Skipped
+#      with a reminder if the ACR doesn't exist yet, which it won't until
+#      the platform layer's first terraform apply.
 #
 # Run from anywhere, requires: az login and gh auth login already done, curl.
 
@@ -37,12 +40,11 @@ GITHUB_USERNAME="lalexgraham"
 REPO_NAME="aca-practice"
 APP_DISPLAY_NAME="github-aca-practice-terraform"
 
-TF_ENVIRONMENT="dev"                      # must match -var="environment=..."
 TFSTATE_RG="rg-tfstate"
 TFSTATE_SA="tfstate19271"
 PROJECT="inspire-app1"                    # must match var.project default
-APP_RG="rg-${PROJECT}-${TF_ENVIRONMENT}"
-ACR_NAME="acr${PROJECT//-/}${TF_ENVIRONMENT}"
+APP_RG="rg-${PROJECT}"                    # platform layer's resource group
+ACR_NAME="acr${PROJECT//-/}"
 
 # -------------------------
 
@@ -174,7 +176,7 @@ echo "Done."
 # az role assignment delete \
 #   --assignee "$APP_ID" \
 #   --role "User Access Administrator" \
-#   --scope "$(az acr show -n acrinspireapp1dev -g rg-inspire-app1-dev --query id -o tsv)"
+#   --scope "$(az acr show -n acrinspireapp1 -g rg-inspire-app1 --query id -o tsv)"
 
 # # this removes the app registration, its service principal, and all three
 # # federated credentials in one go

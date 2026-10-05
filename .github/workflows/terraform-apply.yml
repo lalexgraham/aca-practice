@@ -1,5 +1,17 @@
 name: Terraform apply
 
+# Flow on a push to main touching infra/**:
+#
+#   plan-platform -> apply-platform (gate: infra-apply)
+#     -> plan-environments (staging + production, planned together, saved)
+#       -> apply-staging (no gate)
+#         -> approve-production (gate: infra-apply-production)
+#           -> apply-production (applies the plan saved above, no re-plan)
+#
+# Every apply job applies a saved plan file, never a fresh plan, so what
+# runs is exactly what was planned earlier in this same workflow run.
+# A layer whose plan has no changes skips its apply (and its approval).
+
 on:
   push:
     branches: [main]
@@ -14,20 +26,21 @@ env:
   ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
   ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
   ARM_USE_OIDC: "true"
-  TF_VAR_environment: dev
+  TF_IN_AUTOMATION: "true"
+  # Pinned: a saved plan can only be applied by the Terraform version that
+  # created it, and the production apply may run days after its plan.
+  TF_VERSION: "1.16.4"
 
 jobs:
-  apply:
+  plan-platform:
     runs-on: ubuntu-latest
-    environment: infra-apply
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    defaults:
+      run:
+        working-directory: infra/platform
     steps:
       - uses: actions/checkout@v4
-
-      - name: Debug secret presence (temporary)
-        run: |
-          echo "client-id set: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM != '' }}"
-          echo "tenant-id set: ${{ secrets.AZURE_TENANT_ID != '' }}"
-          echo "subscription-id set: ${{ secrets.AZURE_SUBSCRIPTION_ID != '' }}"
 
       - uses: azure/login@v2
         with:
@@ -36,14 +49,224 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
 
       - run: |
           terraform init -input=false \
             -backend-config="resource_group_name=${{ vars.TFSTATE_RG }}" \
             -backend-config="storage_account_name=${{ vars.TFSTATE_SA }}" \
             -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
-            -backend-config="key=phase1.tfstate"
-        working-directory: infra
+            -backend-config="key=aca-practice-platform.tfstate"
 
-      - run: terraform apply -input=false -auto-approve
-        working-directory: infra
+      - id: plan
+        run: |
+          # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes
+          set +e
+          terraform plan -input=false -no-color -detailed-exitcode -out=tfplan
+          code=$?
+          set -e
+          if [ "$code" -eq 1 ]; then exit 1; fi
+          if [ "$code" -eq 2 ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-platform
+          path: infra/platform/tfplan
+          if-no-files-found: error
+          overwrite: true # lets "Re-run all jobs" replace the plan from an earlier attempt
+
+  apply-platform:
+    needs: plan-platform
+    if: needs.plan-platform.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    environment: infra-apply
+    concurrency: terraform-platform
+    defaults:
+      run:
+        working-directory: infra/platform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_SA }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=aca-practice-platform.tfstate"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-platform
+          path: infra/platform
+
+      - run: terraform apply -input=false tfplan
+
+  # Staging and production are planned side by side, from the same commit,
+  # after the platform is up to date. The production plan is saved here and
+  # is the one apply-production uses after approval - it is never re-planned.
+  plan-environments:
+    needs: [plan-platform, apply-platform]
+    # apply-platform is skipped when the platform has no changes; still run.
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        environment: [staging, production]
+    outputs:
+      # Each matrix leg only sets the output named after its own environment.
+      staging: ${{ steps.plan.outputs.staging }}
+      production: ${{ steps.plan.outputs.production }}
+    defaults:
+      run:
+        working-directory: infra/environment
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_SA }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=aca-practice-${{ matrix.environment }}.tfstate"
+
+      - id: plan
+        run: |
+          # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes
+          set +e
+          terraform plan -input=false -no-color -detailed-exitcode \
+            -var="environment=${{ matrix.environment }}" -out=tfplan
+          code=$?
+          set -e
+          if [ "$code" -eq 1 ]; then exit 1; fi
+          if [ "$code" -eq 2 ]; then
+            echo "${{ matrix.environment }}=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "${{ matrix.environment }}=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: infra/environment/tfplan
+          if-no-files-found: error
+          overwrite: true # lets "Re-run all jobs" replace the plan from an earlier attempt
+
+  apply-staging:
+    needs: plan-environments
+    if: ${{ !failure() && !cancelled() && needs.plan-environments.outputs.staging == 'true' }}
+    runs-on: ubuntu-latest
+    concurrency: terraform-staging
+    defaults:
+      run:
+        working-directory: infra/environment
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_SA }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=aca-practice-staging.tfstate"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-staging
+          path: infra/environment
+
+      - run: terraform apply -input=false tfplan
+
+  # Approval gate only: this job does nothing but wait for the required
+  # reviewer on the infra-apply-production GitHub Environment. It is kept
+  # separate from apply-production on purpose - a job with `environment:`
+  # gets an OIDC subject of environment:<name>, which the existing federated
+  # credentials don't cover. Gating here and applying in the next job (whose
+  # subject is still ref:refs/heads/main) leaves the OIDC trust untouched.
+  approve-production:
+    needs: [plan-environments, apply-staging]
+    # Runs after staging succeeded, or was skipped for having no changes.
+    # Never runs if staging failed.
+    if: ${{ !failure() && !cancelled() && needs.plan-environments.outputs.production == 'true' }}
+    runs-on: ubuntu-latest
+    environment: infra-apply-production
+    steps:
+      - run: echo "Production infra apply approved for ${{ github.sha }}"
+
+  apply-production:
+    needs: [plan-environments, approve-production]
+    if: ${{ !failure() && !cancelled() && needs.approve-production.result == 'success' }}
+    runs-on: ubuntu-latest
+    concurrency: terraform-production
+    defaults:
+      run:
+        working-directory: infra/environment
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_SA }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=aca-practice-production.tfstate"
+
+      # The plan saved by plan-environments before the gate. If production's
+      # state has moved on since (e.g. a newer run was promoted first),
+      # Terraform refuses it as stale rather than applying something else.
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-production
+          path: infra/environment
+
+      - run: terraform apply -input=false tfplan

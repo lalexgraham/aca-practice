@@ -1,10 +1,18 @@
-# Copy to backend.hcl (gitignored) and fill in real values for local runs:
-#   terraform init -backend-config=backend.hcl
+# Copy to backend.hcl (gitignored) and fill in real values for local runs.
 #
-# In CI these same four values come from repo/environment variables,
-# not secrets. They're a container name, not credentials.
+# In CI these same three values come from repo variables, not secrets.
+# They're a container name, not credentials.
+#
+# There is deliberately no `key` here: each layer / environment has its own
+# state file in this one container, so the key is passed separately at init:
+#
+#   cd infra/platform
+#   terraform init -backend-config=../backend.hcl -backend-config="key=aca-practice-platform.tfstate"
+#
+#   cd infra/environment
+#   terraform init -reconfigure -backend-config=../backend.hcl -backend-config="key=aca-practice-staging.tfstate"
+#   terraform init -reconfigure -backend-config=../backend.hcl -backend-config="key=aca-practice-production.tfstate"
 
 resource_group_name  = "rg-tfstate"
 storage_account_name = "sttfstateinspire<unique-suffix>"
 container_name       = "tfstate"
-key                  = "phase1.tfstate"

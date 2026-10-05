@@ -1,4 +1,10 @@
 # .github/workflows/terraform-plan.yml (on pull_request)
+#
+# Plans whichever layers the PR touches and posts each plan as a PR comment.
+# Applies nothing. A change under infra/platform plans the platform layer,
+# a change under infra/environment plans both staging and production.
+name: Terraform plan
+
 on:
   pull_request:
     paths: ["infra/**"]
@@ -13,24 +19,103 @@ env:
   ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
   ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
   ARM_USE_OIDC: "true"
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.16.4" # keep in step with terraform-apply.yml
 
 jobs:
-  plan:
+  changes:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.filter.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # the PR merge commit plus its parents
+
+      - id: filter
+        run: |
+          # HEAD is the PR merge commit, HEAD^1 is the base branch.
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          echo "$changed"
+
+          layers=()
+          if grep -q '^infra/platform/' <<< "$changed"; then
+            layers+=('{"layer":"platform","dir":"infra/platform","key":"aca-practice-platform.tfstate","vars":""}')
+          fi
+          if grep -q '^infra/environment/' <<< "$changed"; then
+            layers+=('{"layer":"staging","dir":"infra/environment","key":"aca-practice-staging.tfstate","vars":"-var=environment=staging"}')
+            layers+=('{"layer":"production","dir":"infra/environment","key":"aca-practice-production.tfstate","vars":"-var=environment=production"}')
+          fi
+
+          matrix="[$(IFS=,; echo "${layers[*]}")]"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  plan:
+    needs: changes
+    if: needs.changes.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.changes.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
       - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
       - run: |
           terraform init -input=false \
             -backend-config="resource_group_name=${{ vars.TFSTATE_RG }}" \
             -backend-config="storage_account_name=${{ vars.TFSTATE_SA }}" \
             -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
-            -backend-config="key=phase1.tfstate"
-        working-directory: infra
-      - run: terraform plan -input=false -no-color -var="environment=dev" 
-        working-directory: infra
+            -backend-config="key=${{ matrix.key }}"
+
+      - id: plan
+        run: |
+          set -o pipefail
+          terraform plan -input=false -no-color ${{ matrix.vars }} 2>&1 | tee plan.txt
+
+      - name: Post plan to the PR
+        if: ${{ !cancelled() && steps.plan.outcome != 'skipped' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LAYER: ${{ matrix.layer }}
+          OUTCOME: ${{ steps.plan.outcome }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # One comment per layer, updated in place on each push to the PR.
+          marker="<!-- terraform-plan:${LAYER} -->"
+          {
+            echo "$marker"
+            echo "### Terraform plan: \`${LAYER}\` (${OUTCOME})"
+            echo
+            echo "State: \`${{ matrix.key }}\`, commit ${{ github.event.pull_request.head.sha }}"
+            echo
+            echo '```'
+            # PR comments aren't secret-masked the way logs are, and GitHub
+            # caps a comment at 65536 characters.
+            sed "s/${ARM_SUBSCRIPTION_ID:-no-subscription-id}/***/g" plan.txt | head -c 60000
+            echo
+            echo '```'
+          } > comment.md
+
+          existing=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"${marker}\")) | .id" | head -n 1)
+
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/${existing}" -F body=@comment.md > /dev/null
+          else
+            gh api -X POST "repos/${{ github.repository }}/issues/${PR}/comments" -F body=@comment.md > /dev/null
+          fi

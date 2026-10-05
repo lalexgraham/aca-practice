@@ -8,3 +8,5 @@ db.sqlite3
 *.md
 infra/backend.hcl
 infra/.terraform/
+infra/*/.terraform/
+infra/*/tfplan
