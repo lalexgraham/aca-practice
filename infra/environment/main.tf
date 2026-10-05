@@ -37,6 +37,10 @@ resource "azurerm_container_app" "this" {
   container_app_environment_id = data.azurerm_container_app_environment.platform.id
   revision_mode                = "Single"
 
+  tags = {
+    purpose = "pipeline-test"
+  }
+
   identity {
     type         = "UserAssigned"
     identity_ids = [azurerm_user_assigned_identity.aca.id]
