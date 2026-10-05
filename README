@@ -32,7 +32,7 @@ If any of that isn't set up yet, refer to Appendix A (macOS/zsh install notes).
 4. Create OIDC identity for Azure to use to authenticate with github 
 5. With OIDC in place, you can now deploy the app through a github workflow (deploy.yml)
 6. Verify the app is up and running
-7. Automate the infra build using Terraform 
+7. Automate the infra build using Terraform, split into a shared platform layer and a staging / production environment layer, with production gated behind an approval in GitHub
 8. Azure Cleanup using Azure CLI 
 9. Azure Cleanup for Terraform
 
@@ -211,6 +211,13 @@ Adding the file `.github/workflows/deploy.yml` and pushing to github on main bra
 
 Push a small change to `main` and watch the Actions tab, this is the point where you've proven the whole chain: commit, build, push to ACR, deploy, all via OIDC with nothing stored.
 
+Once the infrastructure is built by Terraform (section 7) there are two Container Apps, `aca-app-staging` and `aca-app-production`, and `deploy.yml` runs as four jobs:
+
+1. `build` builds the image once, tags it with the commit SHA and pushes it to ACR
+2. `deploy-staging` deploys that tag to `aca-app-staging` automatically
+3. `approve-production` waits for a reviewer to approve in GitHub (the `app-deploy-production` GitHub Environment, see section 7)
+4. `deploy-production` deploys the same tag to `aca-app-production`. Nothing is rebuilt, production gets the image staging is already running
+
 ---
 
 ## 6. Verify
@@ -242,14 +249,46 @@ Storage account names are globally unique and alphanumeric only, same constraint
 
 ### At this point install terraform, if required (see Appendix A)
 
+### How the Terraform is laid out
+
+The infrastructure is split into two layers, each with its own directory and its own state file in the state storage account:
+
+| Layer | Directory | State key | What it owns |
+|---|---|---|---|
+| Platform | `infra/platform` | `aca-practice-platform.tfstate` | Resource group `rg-inspire-app1`, ACR `acrinspireapp1`, Log Analytics workspace, Container Apps Environment. Provisioned once, shared |
+| Environment (staging) | `infra/environment` | `aca-practice-staging.tfstate` | Container App `aca-app-staging`, its identity and its AcrPull role assignment |
+| Environment (production) | `infra/environment` | `aca-practice-production.tfstate` | Container App `aca-app-production`, its identity and its AcrPull role assignment |
+
+The environment layer is one set of Terraform files applied twice, once with `environment=staging` and once with `environment=production`. Both Container Apps run inside the one shared Container Apps Environment. The environment layer finds the platform resources by name, so the platform layer has to be applied first.
+
+The word "environment" means three different things in this project, keep them apart:
+
+- the Terraform variable `environment` is `staging` or `production` and picks which Container App is being managed
+- the Container Apps Environment is the Azure resource both Container Apps run inside (platform layer)
+- a GitHub Environment (`infra-apply`, `infra-apply-production`, `app-deploy-production`) is only an approval gate in GitHub, the names are deliberately not `staging` / `production` so they can't be mistaken for the Terraform variable
+
 ### Run Terraform commands locally to plan
+
+`backend.hcl` holds the storage account details but no `key`, because each layer has its own state file. Pass the key at init:
+
 ```bash
-terraform init -backend-config=backend.hcl
+cd infra/platform
+terraform init -backend-config=../backend.hcl -backend-config="key=aca-practice-platform.tfstate"
 terraform fmt -check -recursive
 terraform validate
-terraform plan -var="environment=dev"
+terraform plan
 ```
-# If that plan looks right, you've proven the whole local loop end to end, and you're ready to open a PR and watch the plan workflow do the same thing in CI.
+
+```bash
+cd infra/environment
+terraform init -reconfigure -backend-config=../backend.hcl -backend-config="key=aca-practice-staging.tfstate"
+terraform validate
+terraform plan -var="environment=staging"
+```
+
+For production, init again with `-reconfigure` and `key=aca-practice-production.tfstate`, then plan with `-var="environment=production"`. Always re-init before switching between staging and production, the state key and the variable have to match.
+
+# If those plans look right, you've proven the whole local loop end to end, and you're ready to open a PR and watch the plan workflow do the same thing in CI.
 
 ### Setup OIDC for Terraform - same principle as OIDC for the deploy
 
@@ -258,30 +297,78 @@ To create the OIDC run setup-terraform-oidc.sh
 ```bash
 bash infra/setup-terraform-oidc.sh
 ```
- 
-### Setup a Github action to kick off a terraform plan on a pr request
- 
-Adding the file `.github/workflows/terraform-plan.yml ` and pushing to github on a separate  branch to main, then creating a pr to merge to main triggers the action to deploy the app to Azure:
 
+Neither OIDC script needs running again for the staging / production split, the app registrations and their federated credentials are unchanged. What does need redoing after the platform and the Container Apps are first created (or recreated) is the role assignments on them, because those are scoped to the resources themselves:
 
-### Setup a Github action to deploy infrastructure using terraform apply on a push to main
+```bash
+TF_SP=$(az ad sp list --display-name github-aca-practice-terraform --query "[0].id" -o tsv)
+DEPLOY_SP=$(az ad sp list --display-name github-aca-practice-deploy --query "[0].id" -o tsv)
+ACR_ID=$(az acr show -n acrinspireapp1 -g rg-inspire-app1 --query id -o tsv)
 
-before doing this, add a manual approver to the repo by doing the following: 
- 
-In the GitHub website:
+# after the platform layer's first apply (the environment layer's apply fails without the first one)
+az role assignment create --assignee-object-id "$TF_SP" --assignee-principal-type ServicePrincipal --role "User Access Administrator" --scope "$ACR_ID"
+az role assignment create --assignee-object-id "$DEPLOY_SP" --assignee-principal-type ServicePrincipal --role AcrPush --scope "$ACR_ID"
 
-Go to the repo's Settings > Environments.
-Click infra-apply, or New environment to create it.
+# after each environment's first apply
+for app in aca-app-staging aca-app-production; do
+  az role assignment create --assignee-object-id "$DEPLOY_SP" --assignee-principal-type ServicePrincipal \
+    --role "Container Apps Contributor" \
+    --scope "$(az containerapp show -n "$app" -g rg-inspire-app1 --query id -o tsv)"
+done
+```
+
+Check the two display names match your app registrations first (`az ad app list --query "[].displayName" -o tsv`).
+
+### Setup the GitHub Environments used as approval gates
+
+In the GitHub website go to the repo's Settings > Environments and create these three (`infra-apply` already exists from the earlier build):
+
+| GitHub Environment | Gates | Required reviewers | Deployment branches |
+|---|---|---|---|
+| `infra-apply` | applying the platform layer | yes | optional, `main` only recommended |
+| `infra-apply-production` | applying the production environment layer | yes | Selected branches and tags, `main` only |
+| `app-deploy-production` | deploying the app to `aca-app-production` | yes | Selected branches and tags, `main` only |
+
+For each one:
+
+Click the environment, or New environment to create it.
 Tick Required reviewers and add up to 6 users or teams.
 Optionally, tick Prevent self-review so the person who pushed can't approve their own run. Leave it off if you're the only reviewer.
+Under Deployment branches and tags choose Selected branches and tags, then Add deployment branch or tag rule, and enter `main`.
 Click Save protection rules.
-Check that the job in the workflow has environment: <name>.
 
-infra-apply is just something that differentiates this environment from a more likely name. So its disassociated from meaning
+Staging has no GitHub Environment at all, it applies and deploys automatically.
 
-Adding the file `.github/workflows/terraform-apply.yml ` and pushing to main triggers the action apply any infrastructure to Azure
+### Github action: terraform plan on a pull request
 
-The `environment: production` line  drops in a  manual approval click in GitHub before `apply` actually runs - this a suggested way to review and "gate" deployments
+`.github/workflows/terraform-plan.yml` runs on any pull request touching `infra/**`. It plans only the layers the PR changed (a change under `infra/platform` plans the platform, a change under `infra/environment` plans both staging and production) and posts each plan as a comment on the PR. Nothing is applied.
+
+### Github action: terraform apply on a push to main
+
+`.github/workflows/terraform-apply.yml` runs on a push to main touching `infra/**`:
+
+1. `plan-platform` plans the platform layer and saves the plan
+2. `apply-platform` waits for approval on `infra-apply`, then applies that saved plan
+3. `plan-environments` plans staging and production side by side and saves both plans
+4. `apply-staging` applies the staging plan automatically
+5. `approve-production` waits for approval on `infra-apply-production`
+6. `apply-production` applies the production plan that was saved in step 3
+
+Promotion to production never plans again, it applies the plan file produced at the same time as the staging one, from the same commit. If production's state has changed in the meantime Terraform rejects the saved plan as stale, re-run the workflow to get a fresh one. A layer with nothing to change skips its apply and its approval.
+
+The approval jobs (`approve-production` in both workflows) are separate jobs that do nothing except wait for the reviewer. That is deliberate: a job with an `environment:` line gets a different OIDC subject (`environment:<name>` instead of `ref:refs/heads/main`), which would need a new federated credential in Azure. Keeping the gate in its own job means the job that actually talks to Azure still uses the existing push-to-main credential.
+
+### Moving from the single dev stack to this layout
+
+The earlier build used one state file (`phase1.tfstate`) and `-dev` resource names (`rg-inspire-app1-dev` and so on). None of that is carried over, the new layers create new resources with new names. Before merging the change that introduces the layers, destroy the old stack from a checkout of the commit before it:
+
+```bash
+cd infra
+terraform init -backend-config=backend.hcl   # key=phase1.tfstate
+TF_VAR_environment=dev terraform destroy
+```
+
+Then on the first merge: approve the platform apply, run the role assignment commands above, and re-run any jobs that failed for lack of them (the environment applies need User Access Administrator on the new ACR, the app deploy needs its roles on the new ACR and Container Apps).
 
 ---
 
@@ -299,16 +386,25 @@ az ad app delete --id <appId>
 
 ### run Terraform destroy
 
+Destroy in the reverse order to the build, both environments first, then the platform:
+
 ```bash
-cd infra
-TF_VAR_environment=dev terraform destroy
+cd infra/environment
+terraform init -reconfigure -backend-config=../backend.hcl -backend-config="key=aca-practice-production.tfstate"
+terraform destroy -var="environment=production"
+
+terraform init -reconfigure -backend-config=../backend.hcl -backend-config="key=aca-practice-staging.tfstate"
+terraform destroy -var="environment=staging"
+
+cd ../platform
+terraform init -backend-config=../backend.hcl -backend-config="key=aca-practice-platform.tfstate"
+terraform destroy
 ```
 
-Review the plan, confirm with `yes`. This tears down everything Terraform
-manages in `rg-aca-practice`, the resource group itself, ACR, Container
-Apps environment, Container App, Log Analytics workspace, the
-user-assigned identity, and the role assignment, in the correct
-dependency order.
+Review each plan, confirm with `yes`. This tears down everything Terraform
+manages in `rg-inspire-app1`: the two Container Apps, their user-assigned
+identities and role assignments, then the Container Apps environment, Log
+Analytics workspace, ACR and the resource group itself.
 
 If you also want to remove the state that Terraform uses:
 
@@ -316,13 +412,13 @@ If you also want to remove the state that Terraform uses:
 az group delete --name rg-tfstate --yes --no-wait
 ```
 
-This removes the storage account and the state file inside it. Nothing is
+This removes the storage account and the state files inside it. Nothing is
 left, not even a record of what Terraform once managed. Rebuilding from
 here means redoing the backend setup from section 7 entirely.
 
 ### OIDC not touched
 
-The two Entra app registrations for, `github-aca-practice` (deploy) and
+The two Entra app registrations for, `github-aca-practice-deploy` (deploy) and
 `github-aca-practice-terraform` (infra), and their federated credentials
 aren't in Terraform state and aren't in either resource group. Leave them
 as-is for a retest, no reason to redo the OIDC setup each cycle.

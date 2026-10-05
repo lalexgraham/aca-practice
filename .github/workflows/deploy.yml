@@ -1,5 +1,12 @@
 name: Build and deploy to Azure Container Apps
 
+# Flow on a push to main:
+#
+#   build (once, tagged with the commit SHA)
+#     -> deploy-staging (automatic)
+#       -> approve-production (gate: app-deploy-production)
+#         -> deploy-production (same image tag, no rebuild)
+
 on:
   push:
     branches: [main]
@@ -9,13 +16,14 @@ permissions:
   contents: read
 
 env:
-  ACR_NAME: acrinspireapp1dev
+  ACR_NAME: acrinspireapp1
   IMAGE_NAME: aca-practice
-  RESOURCE_GROUP: rg-inspire-app1-dev
-  CONTAINER_APP: ca-inspire-app1-dev
+  RESOURCE_GROUP: rg-inspire-app1
+  STAGING_CONTAINER_APP: aca-app-staging
+  PRODUCTION_CONTAINER_APP: aca-app-production
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,16 +35,61 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-
       - name: Build and push image to ACR
         run: |
           az acr login --name ${{ env.ACR_NAME }}
           docker build -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }} .
           docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
-      
-      - name: Deploy new image to Container App
+
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    concurrency: app-deploy-staging
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy image to staging
         run: |
           az containerapp update \
-            --name ${{ env.CONTAINER_APP }} \
+            --name ${{ env.STAGING_CONTAINER_APP }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  # Approval gate only: this job does nothing but wait for the required
+  # reviewer on the app-deploy-production GitHub Environment. It is kept
+  # separate from deploy-production on purpose - a job with `environment:`
+  # gets an OIDC subject of environment:<name>, which the deploy identity's
+  # one federated credential (ref:refs/heads/main) doesn't cover. Gating
+  # here and deploying in the next job leaves the OIDC trust untouched.
+  approve-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: app-deploy-production
+    steps:
+      - run: echo "Production deploy approved for ${{ github.sha }}"
+
+  deploy-production:
+    needs: approve-production
+    runs-on: ubuntu-latest
+    concurrency: app-deploy-production
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # No checkout, no docker build: this promotes the image the build job
+      # pushed and staging is already running, by the same commit SHA tag.
+      - name: Deploy the staging image to production
+        run: |
+          az containerapp update \
+            --name ${{ env.PRODUCTION_CONTAINER_APP }} \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --image ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}

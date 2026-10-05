@@ -21,9 +21,9 @@
 #      repo and branch". This is what lets deploy.yml authenticate with
 #      no stored password/secret - GitHub mints a short-lived token per
 #      run, Azure checks it against this rule instead of a stored secret.
-#   5. Grants AcrPush on the ACR and Container Apps Contributor on the
-#      container app (skipped with a reminder if Terraform hasn't created
-#      them yet).
+#   5. Grants AcrPush on the ACR and Container Apps Contributor on both
+#      container apps, staging and production (each skipped with a reminder
+#      if Terraform hasn't created it yet).
 #   6. Sets the AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID
 #      GitHub repo secrets used by deploy.yml.
 #
@@ -35,9 +35,9 @@ set -euo pipefail
 GITHUB_USERNAME="lalexgraham"
 REPO_NAME="aca-practice"
 APP_DISPLAY_NAME="github-aca-practice-deploy"
-RESOURCE_GROUP="rg-inspire-app1-dev"
-ACR_NAME="acrinspireapp1dev"
-CONTAINER_APP_NAME="ca-inspire-app1-dev"
+RESOURCE_GROUP="rg-inspire-app1"
+ACR_NAME="acrinspireapp1"
+CONTAINER_APP_NAMES=("aca-app-staging" "aca-app-production")
 # -------------------------
 
 echo "Fetching GitHub owner and repo IDs (public API, no auth needed)..."
@@ -59,10 +59,12 @@ echo "App (client) ID: $APP_ID"
 echo "Creating service principal..."
 az ad sp create --id "$APP_ID" >/dev/null
 
-# deploy.yml has no `environment:` block and only triggers on push to main,
-# so unlike terraform-apply.yml (which needed both a ref subject and an
-# environment subject, see setup-terraform-oidc.sh) this only ever needs
-# the one subject below. GitHub's "immutable subject" format embeds the
+# deploy.yml only triggers on push to main, and none of its jobs that log
+# in to Azure has an `environment:` block (the production approval gate is
+# its own job, approve-production, which never touches Azure), so unlike
+# terraform-apply.yml (which needed both a ref subject and an environment
+# subject, see setup-terraform-oidc.sh) this only ever needs the one
+# subject below. GitHub's "immutable subject" format embeds the
 # permanent owner/repo IDs rather than their current names, so it's this
 # @<id> form or authentication fails with AADSTS700213.
 DEPLOY_SUBJECT="repo:${GITHUB_USERNAME}@${OWNER_ID}/${REPO_NAME}@${REPO_ID}:ref:refs/heads/main"
@@ -102,17 +104,21 @@ else
   echo "   az role assignment create --assignee-object-id $SP_OBJECT_ID --assignee-principal-type ServicePrincipal --role AcrPush --scope \"\$(az acr show -n $ACR_NAME -g $RESOURCE_GROUP --query id -o tsv)\""
 fi
 
-echo "Granting Container Apps Contributor on the container app..."
-if CONTAINER_APP_ID=$(az containerapp show -n "$CONTAINER_APP_NAME" -g "$RESOURCE_GROUP" --query id -o tsv 2>/dev/null); then
-  az role assignment create \
-    --assignee-object-id "$SP_OBJECT_ID" \
-    --assignee-principal-type ServicePrincipal \
-    --role "Container Apps Contributor" \
-    --scope "$CONTAINER_APP_ID"
-else
-  echo "   Container app ${CONTAINER_APP_NAME} doesn't exist yet. After the first terraform apply, run:"
-  echo "   az role assignment create --assignee-object-id $SP_OBJECT_ID --assignee-principal-type ServicePrincipal --role \"Container Apps Contributor\" --scope \"\$(az containerapp show -n $CONTAINER_APP_NAME -g $RESOURCE_GROUP --query id -o tsv)\""
-fi
+# One identity covers both apps: the staging/production separation is
+# enforced by the approval gate in deploy.yml, not by Azure RBAC.
+for CONTAINER_APP_NAME in "${CONTAINER_APP_NAMES[@]}"; do
+  echo "Granting Container Apps Contributor on ${CONTAINER_APP_NAME}..."
+  if CONTAINER_APP_ID=$(az containerapp show -n "$CONTAINER_APP_NAME" -g "$RESOURCE_GROUP" --query id -o tsv 2>/dev/null); then
+    az role assignment create \
+      --assignee-object-id "$SP_OBJECT_ID" \
+      --assignee-principal-type ServicePrincipal \
+      --role "Container Apps Contributor" \
+      --scope "$CONTAINER_APP_ID"
+  else
+    echo "   Container app ${CONTAINER_APP_NAME} doesn't exist yet. After the first terraform apply, run:"
+    echo "   az role assignment create --assignee-object-id $SP_OBJECT_ID --assignee-principal-type ServicePrincipal --role \"Container Apps Contributor\" --scope \"\$(az containerapp show -n $CONTAINER_APP_NAME -g $RESOURCE_GROUP --query id -o tsv)\""
+  fi
+done
 
 # AZURE_CLIENT_ID is a *different* secret to AZURE_CLIENT_ID_TERRAFORM -
 # deploy.yml and the Terraform workflows each authenticate as their own app
@@ -132,17 +138,19 @@ echo "Done."
 
 # # remove the scoped role assignments first, while the SP still exists to
 # # resolve them (deleting the app orphans these rather than reliably
-# # cleaning them up). Only needed if the ACR / container app still exist -
+# # cleaning them up). Only needed if the ACR / container apps still exist -
 # # terraform destroy removes their role assignments with them.
 # az role assignment delete \
 #   --assignee "$APP_ID" \
 #   --role AcrPush \
-#   --scope "$(az acr show -n acrinspireapp1dev -g rg-inspire-app1-dev --query id -o tsv)"
+#   --scope "$(az acr show -n acrinspireapp1 -g rg-inspire-app1 --query id -o tsv)"
 
-# az role assignment delete \
-#   --assignee "$APP_ID" \
-#   --role "Container Apps Contributor" \
-#   --scope "$(az containerapp show -n ca-inspire-app1-dev -g rg-inspire-app1-dev --query id -o tsv)"
+# for app in aca-app-staging aca-app-production; do
+#   az role assignment delete \
+#     --assignee "$APP_ID" \
+#     --role "Container Apps Contributor" \
+#     --scope "$(az containerapp show -n "$app" -g rg-inspire-app1 --query id -o tsv)"
+# done
 
 # # confirm nothing is left (should print an empty table)
 # az role assignment list --assignee "$APP_ID" --all -o table
