@@ -321,21 +321,21 @@ Check the two display names match your app registrations first (`az ad app list 
 
 ### Setup the GitHub Environments used as approval gates
 
-In the GitHub website go to the repo's Settings > Environments and create these three (`infra-apply` already exists from the earlier build):
+These three environments, and the branch protection on `main`, are set up by a script rather than by hand in the GitHub website, so the script is the source of truth and re-running it puts any manual UI change back:
 
-| GitHub Environment | Gates | Required reviewers | Deployment branches |
-|---|---|---|---|
-| `infra-apply` | applying the platform layer | yes | optional, `main` only recommended |
-| `infra-apply-production` | applying the production environment layer | yes | Selected branches and tags, `main` only |
-| `app-deploy-production` | deploying the app to `aca-app-production` | yes | Selected branches and tags, `main` only |
+```bash
+bash infra/setup-github-protection.sh
+```
 
-For each one:
+| GitHub Environment | Gates | Required reviewers | Admins can bypass | Deployment branches |
+|---|---|---|---|---|
+| `infra-apply` | applying the platform layer | yes | no | Selected branches, `main` only |
+| `infra-apply-production` | applying the production environment layer | yes | no | Selected branches, `main` only |
+| `app-deploy-production` | deploying the app to `aca-app-production` | yes | no | Selected branches, `main` only |
 
-Click the environment, or New environment to create it.
-Tick Required reviewers and add up to 6 users or teams.
-Optionally, tick Prevent self-review so the person who pushed can't approve their own run. Leave it off if you're the only reviewer.
-Under Deployment branches and tags choose Selected branches and tags, then Add deployment branch or tag rule, and enter `main`.
-Click Save protection rules.
+"Admins can bypass" is off so the reviewer and branch rule apply to the repo owner too, otherwise the owner could skip the gate. Prevent self-review is left off because there is only one reviewer. The script also sets `main`'s branch protection: the `plan` status check (see below) must pass before merging.
+
+To check the live settings against this, use the VERIFY commands at the bottom of the script.
 
 Staging has no GitHub Environment at all, it applies and deploys automatically.
 
