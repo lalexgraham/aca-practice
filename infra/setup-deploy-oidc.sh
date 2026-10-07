@@ -27,6 +27,12 @@
 #   6. Sets the AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID
 #      GitHub repo secrets used by deploy.yml.
 #
+# Safe to re-run: it reuses the app registration and service principal if
+# they exist, only creates the federated credential and role assignments that
+# are missing, and gh secret set overwrites with the same value. Re-run it
+# after the first terraform apply to pick up the grants that were skipped
+# because their resources didn't exist yet.
+#
 # Run from anywhere, requires: az login and gh auth login already done, curl.
 
 set -euo pipefail
@@ -52,12 +58,39 @@ fi
 echo "Owner ID: $OWNER_ID"
 echo "Repo ID:  $REPO_ID"
 
-echo "Creating app registration: $APP_DISPLAY_NAME"
-APP_ID=$(az ad app create --display-name "$APP_DISPLAY_NAME" --query appId -o tsv)
+APP_ID=$(az ad app list --display-name "$APP_DISPLAY_NAME" --query "[0].appId" -o tsv)
+if [[ -n "$APP_ID" ]]; then
+  echo "App registration $APP_DISPLAY_NAME already exists, reusing it"
+else
+  echo "Creating app registration: $APP_DISPLAY_NAME"
+  APP_ID=$(az ad app create --display-name "$APP_DISPLAY_NAME" --query appId -o tsv)
+fi
 echo "App (client) ID: $APP_ID"
 
-echo "Creating service principal..."
-az ad sp create --id "$APP_ID" >/dev/null
+if az ad sp show --id "$APP_ID" >/dev/null 2>&1; then
+  echo "Service principal already exists, reusing it"
+else
+  echo "Creating service principal..."
+  az ad sp create --id "$APP_ID" >/dev/null
+fi
+
+# Create a role assignment only if the principal doesn't already hold it at
+# exactly this scope.
+ensure_role() {
+  local role="$1" scope="$2"
+  # Compared case-insensitively: Azure doesn't always return a scope in the
+  # same casing it was given (resourceGroups vs resourcegroups).
+  if az role assignment list --assignee "$SP_OBJECT_ID" --role "$role" --scope "$scope" \
+       --query "[].scope" -o tsv | grep -qixF "$scope"; then
+    echo "   ${role} on ${scope##*/} already granted, skipping"
+    return
+  fi
+  az role assignment create \
+    --assignee-object-id "$SP_OBJECT_ID" \
+    --assignee-principal-type ServicePrincipal \
+    --role "$role" \
+    --scope "$scope" >/dev/null
+}
 
 # deploy.yml only triggers on push to main, and none of its jobs that log
 # in to Azure has an `environment:` block (the production approval gate is
@@ -70,14 +103,18 @@ az ad sp create --id "$APP_ID" >/dev/null
 DEPLOY_SUBJECT="repo:${GITHUB_USERNAME}@${OWNER_ID}/${REPO_NAME}@${REPO_ID}:ref:refs/heads/main"
 
 echo "Creating federated credential for deploy.yml (push to main)..."
-az ad app federated-credential create \
-  --id "$APP_ID" \
-  --parameters "{
-    \"name\": \"github-deploy-main\",
-    \"issuer\": \"https://token.actions.githubusercontent.com\",
-    \"subject\": \"${DEPLOY_SUBJECT}\",
-    \"audiences\": [\"api://AzureADTokenExchange\"]
-  }"
+if [[ -n "$(az ad app federated-credential list --id "$APP_ID" --query "[?name=='github-deploy-main'].name | [0]" -o tsv)" ]]; then
+  echo "   federated credential github-deploy-main already exists, skipping"
+else
+  az ad app federated-credential create \
+    --id "$APP_ID" \
+    --parameters "{
+      \"name\": \"github-deploy-main\",
+      \"issuer\": \"https://token.actions.githubusercontent.com\",
+      \"subject\": \"${DEPLOY_SUBJECT}\",
+      \"audiences\": [\"api://AzureADTokenExchange\"]
+    }" >/dev/null
+fi
 
 echo "Done creating app registration and federated credential. Granting roles and setting GitHub secrets..."
 
@@ -94,11 +131,7 @@ SP_OBJECT_ID=$(az ad sp show --id "$APP_ID" --query id -o tsv)
 # runs before the first terraform apply.
 echo "Granting AcrPush on the ACR..."
 if ACR_ID=$(az acr show -n "$ACR_NAME" -g "$RESOURCE_GROUP" --query id -o tsv 2>/dev/null); then
-  az role assignment create \
-    --assignee-object-id "$SP_OBJECT_ID" \
-    --assignee-principal-type ServicePrincipal \
-    --role AcrPush \
-    --scope "$ACR_ID"
+  ensure_role "AcrPush" "$ACR_ID"
 else
   echo "   ACR ${ACR_NAME} doesn't exist yet. After the first terraform apply, run:"
   echo "   az role assignment create --assignee-object-id $SP_OBJECT_ID --assignee-principal-type ServicePrincipal --role AcrPush --scope \"\$(az acr show -n $ACR_NAME -g $RESOURCE_GROUP --query id -o tsv)\""
@@ -109,11 +142,7 @@ fi
 for CONTAINER_APP_NAME in "${CONTAINER_APP_NAMES[@]}"; do
   echo "Granting Container Apps Contributor on ${CONTAINER_APP_NAME}..."
   if CONTAINER_APP_ID=$(az containerapp show -n "$CONTAINER_APP_NAME" -g "$RESOURCE_GROUP" --query id -o tsv 2>/dev/null); then
-    az role assignment create \
-      --assignee-object-id "$SP_OBJECT_ID" \
-      --assignee-principal-type ServicePrincipal \
-      --role "Container Apps Contributor" \
-      --scope "$CONTAINER_APP_ID"
+    ensure_role "Container Apps Contributor" "$CONTAINER_APP_ID"
   else
     echo "   Container app ${CONTAINER_APP_NAME} doesn't exist yet. After the first terraform apply, run:"
     echo "   az role assignment create --assignee-object-id $SP_OBJECT_ID --assignee-principal-type ServicePrincipal --role \"Container Apps Contributor\" --scope \"\$(az containerapp show -n $CONTAINER_APP_NAME -g $RESOURCE_GROUP --query id -o tsv)\""

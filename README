@@ -84,7 +84,7 @@ Add a minimal `Dockerfile`, no `ENV` line, config comes in at run time instead:
 ```dockerfile
 FROM python:3.12-slim
 WORKDIR /app
-RUN pip install django gunicorn
+RUN pip install django gunicorn azure-identity azure-keyvault-secrets
 COPY . .
 EXPOSE 8000
 CMD ["gunicorn", "core.wsgi:application", "--bind", "0.0.0.0:8000"]
@@ -256,8 +256,8 @@ The infrastructure is split into two layers, each with its own directory and its
 | Layer | Directory | State key | What it owns |
 |---|---|---|---|
 | Platform | `infra/platform` | `aca-practice-platform.tfstate` | Resource group `rg-inspire-app1`, ACR `acrinspireapp1`, Log Analytics workspace, Container Apps Environment. Provisioned once, shared |
-| Environment (staging) | `infra/environment` | `aca-practice-staging.tfstate` | Container App `aca-app-staging`, its identity and its AcrPull role assignment |
-| Environment (production) | `infra/environment` | `aca-practice-production.tfstate` | Container App `aca-app-production`, its identity and its AcrPull role assignment |
+| Environment (staging) | `infra/environment` | `aca-practice-staging.tfstate` | Container App `aca-app-staging`, its identity and its AcrPull role assignment, its Key Vault and the identity's read access to it |
+| Environment (production) | `infra/environment` | `aca-practice-production.tfstate` | Container App `aca-app-production`, its identity and its AcrPull role assignment, its Key Vault and the identity's read access to it |
 
 The environment layer is one set of Terraform files applied twice, once with `environment=staging` and once with `environment=production`. Both Container Apps run inside the one shared Container Apps Environment. The environment layer finds the platform resources by name, so the platform layer has to be applied first.
 
@@ -360,6 +360,57 @@ Promotion to production never plans again, it applies the plan file produced at 
 
 The approval jobs (`approve-production` in both workflows) are separate jobs that do nothing except wait for the reviewer. That is deliberate: a job with an `environment:` line gets a different OIDC subject (`environment:<name>` instead of `ref:refs/heads/main`), which would need a new federated credential in Azure. Keeping the gate in its own job means the job that actually talks to Azure still uses the existing push-to-main credential.
 
+### Storing a secret in Azure Key Vault, and reading it from Django
+
+An end to end example of the usual pattern: a script puts a secret value into Azure Key Vault, and the running app reads it with its managed identity, with no password or key stored anywhere in the code, the image, the environment variables or the Terraform state.
+
+```
+set-keyvault-secret.sh --> Key Vault (one per environment) <-- core/keyvault.py <-- GET /secret/
+   you, via az login        secret value, versioned           app's managed identity
+```
+
+**The pieces**
+
+| What | Where |
+|---|---|
+| The vault, the app identity's read-only role on it, and audit logging | `infra/environment/keyvault.tf` |
+| The vault's address, the secret's name and the identity's client ID passed to the app as environment variables (none of them is secret) | `infra/environment/main.tf` |
+| The script that asks for the value and stores it | `infra/set-keyvault-secret.sh` |
+| The code that reads it, with caching | `core/keyvault.py` |
+| The page that prints it | `show_secret` in `core/urls.py`, at `/secret/` |
+
+**Run order.** The first time:
+
+1. Re-run `bash infra/setup-terraform-oidc.sh`. It is safe to re-run, it skips what already exists and adds the one missing grant, User Access Administrator on the resource group, which Terraform needs to create the app identity's role assignment on the vault.
+2. Merge this change so `terraform-apply.yml` creates the vaults and gives the apps their `KEY_VAULT_*` environment variables. Approve the production apply.
+3. Store a value: `bash infra/set-keyvault-secret.sh staging` (then `production` when ready). Use a dummy value.
+4. The app deploy from the same merge ships the code. Visit `https://<app fqdn>/secret/` (the FQDN is in `terraform output container_app_fqdn`) and it prints the value.
+
+Role assignments can take a few minutes to reach the vault. If the page shows "Could not read the secret", wait a little and check the container logs (`az containerapp logs show -n aca-app-staging -g rg-inspire-app1`).
+
+To rotate, run the script again with the new value. That adds a new version of the secret and the app picks it up within a minute (`CACHE_SECONDS`). Locally, `KEY_VAULT_URL` set in `.env` plus `az login` is enough, `DefaultAzureCredential` falls back to your CLI login.
+
+**Best practice, and where it's applied here**
+
+- **Managed identity, no credentials.** The app authenticates as its user-assigned identity. There is no client secret to store, leak or rotate.
+- **Azure RBAC, not access policies.** The vault has `rbac_authorization_enabled`. Access policies are the legacy model, separate from the rest of Azure's permissions.
+- **Least privilege.** The app gets `Key Vault Secrets User` (read secret values, nothing else), scoped to its own vault. You get `Key Vault Secrets Officer` on the vault only, not a subscription-wide role. Being Owner of the subscription doesn't grant data access to the vault by itself.
+- **One vault per environment.** Staging's identity can't read production's secrets, and a leak in one doesn't expose the other.
+- **Secret values stay out of Terraform.** Anything in Terraform lands in plaintext in the state file. Terraform owns the vault and who can use it, the script owns the value.
+- **The value is never on a command line.** The script reads it with no echo, and passes it to `az` on stdin, so it doesn't appear in shell history or the process list.
+- **Expiry and content type are set** on every secret (90 days here), so stale secrets are visible and an expiry alert can be hung off them.
+- **Soft delete (always on) and purge protection (production).** A deleted secret or vault is recoverable for 90 days, and with purge protection nobody can permanently delete it inside that window. Purge protection can't be turned off once on, and it locks a destroyed vault's name for 90 days, so staging leaves it off.
+- **Audit logging.** Every read, write and delete, with the caller's identity, goes to the Log Analytics workspace (`AuditEvent`). Query it with `AzureDiagnostics | where ResourceProvider == "MICROSOFT.KEYVAULT"`.
+- **Cache reads, reuse the client.** Vaults throttle requests, so `core/keyvault.py` caches the value for 60 seconds and builds the client once so the token is reused.
+- **Errors don't leak.** The page says "Could not read the secret", the real exception goes to the container logs only.
+
+**Not done here, worth knowing about**
+
+- **`/secret/` prints the secret to anyone who can reach the URL.** That's what makes it a good demo and a bad design. A real app uses the secret and never displays it. Use a dummy value, and delete the view and its route when you've seen it work.
+- **The vault keeps its public endpoint.** Locking it to a private endpoint or firewall needs a VNet-integrated Container Apps environment, which this practice stack doesn't have. Access is still limited to authenticated identities with a role.
+- **The Terraform identity's User Access Administrator isn't restricted** to particular roles. An ABAC condition on the assignment can limit it to granting only `Key Vault Secrets User`.
+- **Container Apps can also pull a Key Vault secret itself** (a `secret` block with `key_vault_secret_id`, surfaced as an environment variable), which means no SDK in the code. It fails to provision if the secret doesn't exist yet at apply time, and the value only changes when a new revision starts, which is why this example reads at runtime instead.
+
 ### Moving from the single dev stack to this layout
 
 The earlier build used one state file (`phase1.tfstate`) and `-dev` resource names (`rg-inspire-app1-dev` and so on). None of that is carried over, the new layers create new resources with new names. Before merging the change that introduces the layers, destroy the old stack from a checkout of the commit before it:
@@ -407,6 +458,8 @@ Review each plan, confirm with `yes`. This tears down everything Terraform
 manages in `rg-inspire-app1`: the two Container Apps, their user-assigned
 identities and role assignments, then the Container Apps environment, Log
 Analytics workspace, ACR and the resource group itself.
+
+The Key Vaults go too. Staging's is purged as part of the destroy, so it can be rebuilt straight away. Production's has purge protection, so it is only soft-deleted: it, and its name, stay reserved for 90 days and can't be purged early. A rebuilt production gets a clash on the vault name unless you recover the old vault (`az keyvault recover --name <vault>`) or wait. The vault name is derived from the project, environment and subscription, so changing `var.project` is the other way round it.
 
 If you also want to remove the state that Terraform uses:
 
@@ -465,7 +518,7 @@ cd aca-practice
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install django gunicorn
+pip install django gunicorn azure-identity azure-keyvault-secrets
 django-admin --version
 ```
 
