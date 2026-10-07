@@ -59,8 +59,10 @@ if [[ -z "$(az role assignment list --assignee "$MY_OBJECT_ID" --scope "$VAULT_I
 fi
 
 echo "Use a dummy value for this demo: the app prints it on a public page."
-read -rs "?Secret value for ${SECRET_NAME}: " SECRET_VALUE; echo
-read -rs "?Confirm: " SECRET_CONFIRM; echo
+# Prompt with printf and a plain `read -rs` so this works under both bash and
+# zsh (zsh's `read "?prompt" var` form is a syntax error in bash).
+printf 'Secret value for %s: ' "$SECRET_NAME"; read -rs SECRET_VALUE; echo
+printf 'Confirm: '; read -rs SECRET_CONFIRM; echo
 if [[ -z "$SECRET_VALUE" || "$SECRET_VALUE" != "$SECRET_CONFIRM" ]]; then
   echo "Empty, or the two values didn't match. Nothing stored." >&2
   exit 1
