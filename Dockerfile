@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 WORKDIR /app
-RUN pip install django gunicorn
+RUN pip install django gunicorn azure-identity azure-keyvault-secrets
 COPY . .
 ENV DJANGO_ALLOWED_HOSTS="*"
 EXPOSE 8000

@@ -67,6 +67,25 @@ resource "azurerm_container_app" "this" {
         name  = "DJANGO_ALLOWED_HOSTS"
         value = "*" # tighten to the real hostname once DNS cutover happens
       }
+
+      # Key Vault access: the app reads the secret at runtime with
+      # DefaultAzureCredential (see core/keyvault.py). These are addresses and
+      # an identity pointer, not secrets. AZURE_CLIENT_ID is what tells the
+      # credential which user-assigned identity to use.
+      env {
+        name  = "KEY_VAULT_URL"
+        value = azurerm_key_vault.this.vault_uri
+      }
+
+      env {
+        name  = "KEY_VAULT_SECRET_NAME"
+        value = var.key_vault_secret_name
+      }
+
+      env {
+        name  = "AZURE_CLIENT_ID"
+        value = azurerm_user_assigned_identity.aca.client_id
+      }
     }
   }
 
@@ -89,5 +108,8 @@ resource "azurerm_container_app" "this" {
   }
 
   # The registry block needs the identity to already hold AcrPull.
-  depends_on = [azurerm_role_assignment.acr_pull]
+  depends_on = [
+    azurerm_role_assignment.acr_pull,
+    azurerm_role_assignment.kv_secrets_user,
+  ]
 }

@@ -31,6 +31,12 @@
 #      with a reminder if the ACR doesn't exist yet, which it won't until
 #      the platform layer's first terraform apply.
 #
+# Safe to re-run: it reuses the app registration and service principal if
+# they exist, only creates federated credentials and role assignments that
+# are missing, and gh secret set overwrites with the same value. Re-run it
+# after the first terraform apply to pick up the grants that were skipped
+# because their resources didn't exist yet.
+#
 # Run from anywhere, requires: az login and gh auth login already done, curl.
 
 set -euo pipefail
@@ -60,50 +66,73 @@ fi
 echo "Owner ID: $OWNER_ID"
 echo "Repo ID:  $REPO_ID"
 
-echo "Creating app registration: $APP_DISPLAY_NAME"
-APP_ID=$(az ad app create --display-name "$APP_DISPLAY_NAME" --query appId -o tsv)
+APP_ID=$(az ad app list --display-name "$APP_DISPLAY_NAME" --query "[0].appId" -o tsv)
+if [[ -n "$APP_ID" ]]; then
+  echo "App registration $APP_DISPLAY_NAME already exists, reusing it"
+else
+  echo "Creating app registration: $APP_DISPLAY_NAME"
+  APP_ID=$(az ad app create --display-name "$APP_DISPLAY_NAME" --query appId -o tsv)
+fi
 echo "App (client) ID: $APP_ID"
 
-echo "Creating service principal..."
-az ad sp create --id "$APP_ID" >/dev/null
+if az ad sp show --id "$APP_ID" >/dev/null 2>&1; then
+  echo "Service principal already exists, reusing it"
+else
+  echo "Creating service principal..."
+  az ad sp create --id "$APP_ID" >/dev/null
+fi
+
+# Create a federated credential only if one with this name doesn't exist yet.
+ensure_federated_credential() {
+  local name="$1" subject="$2"
+  if [[ -n "$(az ad app federated-credential list --id "$APP_ID" --query "[?name=='${name}'].name | [0]" -o tsv)" ]]; then
+    echo "   federated credential ${name} already exists, skipping"
+    return
+  fi
+  az ad app federated-credential create \
+    --id "$APP_ID" \
+    --parameters "{
+      \"name\": \"${name}\",
+      \"issuer\": \"https://token.actions.githubusercontent.com\",
+      \"subject\": \"${subject}\",
+      \"audiences\": [\"api://AzureADTokenExchange\"]
+    }" >/dev/null
+}
+
+# Create a role assignment only if the principal doesn't already hold it at
+# exactly this scope.
+ensure_role() {
+  local role="$1" scope="$2"
+  # Compared case-insensitively: Azure doesn't always return a scope in the
+  # same casing it was given (resourceGroups vs resourcegroups).
+  if az role assignment list --assignee "$SP_OBJECT_ID" --role "$role" --scope "$scope" \
+       --query "[].scope" -o tsv | grep -qixF "$scope"; then
+    echo "   ${role} on ${scope##*/} already granted, skipping"
+    return
+  fi
+  az role assignment create \
+    --assignee-object-id "$SP_OBJECT_ID" \
+    --assignee-principal-type ServicePrincipal \
+    --role "$role" \
+    --scope "$scope" >/dev/null
+}
 
 APPLY_SUBJECT="repo:${GITHUB_USERNAME}@${OWNER_ID}/${REPO_NAME}@${REPO_ID}:ref:refs/heads/main"
 APPLY_ENV_SUBJECT="repo:${GITHUB_USERNAME}@${OWNER_ID}/${REPO_NAME}@${REPO_ID}:environment:infra-apply"
 PLAN_SUBJECT="repo:${GITHUB_USERNAME}@${OWNER_ID}/${REPO_NAME}@${REPO_ID}:pull_request"
 
 echo "Creating federated credential for terraform-apply.yml (push to main)..."
-az ad app federated-credential create \
-  --id "$APP_ID" \
-  --parameters "{
-    \"name\": \"github-tf-apply-main\",
-    \"issuer\": \"https://token.actions.githubusercontent.com\",
-    \"subject\": \"${APPLY_SUBJECT}\",
-    \"audiences\": [\"api://AzureADTokenExchange\"]
-  }"
+ensure_federated_credential "github-tf-apply-main" "${APPLY_SUBJECT}"
 
 echo "Creating federated credential for terraform-apply.yml (infra-apply environment)..."
 # terraform-apply.yml's job sets `environment: infra-apply`, which changes
 # the OIDC subject GitHub issues from ref:refs/heads/main to
 # environment:infra-apply. Both credentials are needed: this one for the
 # environment-scoped subject, the ref one above is harmless to keep.
-az ad app federated-credential create \
-  --id "$APP_ID" \
-  --parameters "{
-    \"name\": \"github-tf-apply-env-infra-apply\",
-    \"issuer\": \"https://token.actions.githubusercontent.com\",
-    \"subject\": \"${APPLY_ENV_SUBJECT}\",
-    \"audiences\": [\"api://AzureADTokenExchange\"]
-  }"
+ensure_federated_credential "github-tf-apply-env-infra-apply" "${APPLY_ENV_SUBJECT}"
 
 echo "Creating federated credential for terraform-plan.yml (pull request)..."
-az ad app federated-credential create \
-  --id "$APP_ID" \
-  --parameters "{
-    \"name\": \"github-tf-plan-pr\",
-    \"issuer\": \"https://token.actions.githubusercontent.com\",
-    \"subject\": \"${PLAN_SUBJECT}\",
-    \"audiences\": [\"api://AzureADTokenExchange\"]
-  }"
+ensure_federated_credential "github-tf-plan-pr" "${PLAN_SUBJECT}"
 
 echo "Done creating app registration and federated credentials. Now grant the app registration the necessary roles on the subscription and storage account. And push secrets to GitHub"
 
@@ -116,19 +145,11 @@ SP_OBJECT_ID=$(az ad sp show --id "$APP_ID" --query id -o tsv)
 
 echo "Granting Contributor at subscription scope..."
 
-az role assignment create \
-  --assignee-object-id "$SP_OBJECT_ID" \
-  --assignee-principal-type ServicePrincipal \
-  --role Contributor \
-  --scope "/subscriptions/${SUBSCRIPTION_ID}"
+ensure_role "Contributor" "/subscriptions/${SUBSCRIPTION_ID}"
 
 echo "Granting Storage Blob Data Contributor on the tfstate storage account..."
 
-az role assignment create \
-  --assignee-object-id "$SP_OBJECT_ID" \
-  --assignee-principal-type ServicePrincipal \
-  --role "Storage Blob Data Contributor" \
-  --scope "$(az storage account show -g "$TFSTATE_RG" -n "$TFSTATE_SA" --query id -o tsv)"
+ensure_role "Storage Blob Data Contributor" "$(az storage account show -g "$TFSTATE_RG" -n "$TFSTATE_SA" --query id -o tsv)"
 
 echo "Setting AZURE_CLIENT_ID_TERRAFORM GitHub secret..."
 
@@ -141,14 +162,24 @@ gh secret set AZURE_CLIENT_ID_TERRAFORM \
 echo "Granting User Access Administrator on the ACR (for azurerm_role_assignment.acr_pull)..."
 
 if ACR_ID=$(az acr show -n "$ACR_NAME" -g "$APP_RG" --query id -o tsv 2>/dev/null); then
-  az role assignment create \
-    --assignee-object-id "$SP_OBJECT_ID" \
-    --assignee-principal-type ServicePrincipal \
-    --role "User Access Administrator" \
-    --scope "$ACR_ID"
+  ensure_role "User Access Administrator" "$ACR_ID"
 else
   echo "   ACR ${ACR_NAME} doesn't exist yet. After the first terraform apply, run:"
   echo "   az role assignment create --assignee-object-id $SP_OBJECT_ID --assignee-principal-type ServicePrincipal --role \"User Access Administrator\" --scope \"\$(az acr show -n $ACR_NAME -g $APP_RG --query id -o tsv)\""
+fi
+
+# Each environment's Key Vault is created by Terraform, along with a role
+# assignment (azurerm_role_assignment.kv_secrets_user) giving the app's
+# identity read access to it. Contributor can't create role assignments and
+# the vault doesn't exist yet to scope a grant to, so this is granted on the
+# resource group instead, which covers the ACR above as well.
+echo "Granting User Access Administrator on the resource group (for azurerm_role_assignment.kv_secrets_user)..."
+
+if RG_ID=$(az group show -n "$APP_RG" --query id -o tsv 2>/dev/null); then
+  ensure_role "User Access Administrator" "$RG_ID"
+else
+  echo "   Resource group ${APP_RG} doesn't exist yet. After the first terraform apply, run:"
+  echo "   az role assignment create --assignee-object-id $SP_OBJECT_ID --assignee-principal-type ServicePrincipal --role \"User Access Administrator\" --scope \"\$(az group show -n $APP_RG --query id -o tsv)\""
 fi
 
 echo ""
@@ -177,6 +208,12 @@ echo "Done."
 #   --assignee "$APP_ID" \
 #   --role "User Access Administrator" \
 #   --scope "$(az acr show -n acrinspireapp1 -g rg-inspire-app1 --query id -o tsv)"
+
+# # only needed if the resource group still exists
+# az role assignment delete \
+#   --assignee "$APP_ID" \
+#   --role "User Access Administrator" \
+#   --scope "$(az group show -n rg-inspire-app1 --query id -o tsv)"
 
 # # this removes the app registration, its service principal, and all three
 # # federated credentials in one go

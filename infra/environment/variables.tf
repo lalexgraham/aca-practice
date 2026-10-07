@@ -19,3 +19,9 @@ variable "container_image" {
   type        = string
   default     = "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest"
 }
+
+variable "key_vault_secret_name" {
+  description = "Name of the demo secret the app reads from this environment's Key Vault. Must match the name infra/set-keyvault-secret.sh writes."
+  type        = string
+  default     = "demo-secret"
+}
