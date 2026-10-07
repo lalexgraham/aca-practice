@@ -2,7 +2,7 @@
 # production's secrets (and vice versa). Terraform owns the vault and who can
 # read it; it deliberately never owns a secret VALUE, because anything set
 # through Terraform ends up in plaintext in the state file. Values are set
-# out of band with infra/set-keyvault-secret.sh.
+# out of band with scripts/set-keyvault-secret.sh.
 
 data "azurerm_client_config" "current" {}
 

@@ -7,9 +7,17 @@ name: Build and deploy to Azure Container Apps
 #       -> approve-production (gate: app-deploy-production)
 #         -> deploy-production (same image tag, no rebuild)
 
+# Only runs when something that goes into the image (or this workflow) changes.
+# README edits, helper scripts and Terraform changes don't rebuild or redeploy
+# the app. Infra changes are handled by terraform-apply.yml.
 on:
   push:
     branches: [main]
+    paths:
+      - "core/**"
+      - "manage.py"
+      - "Dockerfile"
+      - ".github/workflows/deploy.yml"
 
 permissions:
   id-token: write
