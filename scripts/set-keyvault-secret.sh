@@ -2,7 +2,7 @@
 # Prompts for a secret value and stores it in an environment's Azure Key
 # Vault, for the Django app to read at /secret/ (core/keyvault.py).
 #
-# Usage: bash infra/set-keyvault-secret.sh <staging|production>
+# Usage: bash scripts/set-keyvault-secret.sh <staging|production>
 #
 # The vault itself is created by Terraform (infra/environment/keyvault.tf);
 # this script only writes the secret VALUE, deliberately outside Terraform so

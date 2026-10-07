@@ -197,10 +197,10 @@ az containerapp show --name aca-practice-app --resource-group rg-aca-practice \
 
 This replaces a stored Azure credential/secret with a trust relationship: GitHub issues a short-lived token per workflow run, Azure trusts it for this specific repo, no long-lived secret to leak or rotate.
 
-To create the OIDC run setup-deploy-oidc.sh
+To create the OIDC run scripts/setup-deploy-oidc.sh
 
 ```bash
-bash infra/setup-deploy-oidc.sh
+bash scripts/setup-deploy-oidc.sh
 ```
 
 ---
@@ -217,6 +217,27 @@ Once the infrastructure is built by Terraform (section 7) there are two Containe
 2. `deploy-staging` deploys that tag to `aca-app-staging` automatically
 3. `approve-production` waits for a reviewer to approve in GitHub (the `app-deploy-production` GitHub Environment, see section 7)
 4. `deploy-production` deploys the same tag to `aca-app-production`. Nothing is rebuilt, production gets the image staging is already running
+
+### Pipelines only run when code changes
+
+Each pipeline is filtered to the files it cares about, so editing the README or a helper script does not start a run:
+
+| Workflow | Runs on a push to `main` when these change |
+|---|---|
+| `deploy.yml` (app) | `core/**`, `manage.py`, `Dockerfile`, `.github/workflows/deploy.yml` |
+| `terraform-apply.yml` (infra) | `infra/**` |
+
+Anything else (`README.md`, `scripts/**`, `.gitignore`) triggers neither. The one exception is `terraform-plan.yml`: it still starts on every pull request, because `main`'s branch protection requires its `plan` check, but it plans nothing and finishes quickly when no `infra/` files changed (see section 7).
+
+To make this work, all the `*.sh` helper scripts moved out of `infra/` into a top-level `scripts/` folder. They are one-off setup tools you run by hand, not Terraform code, and while they lived under `infra/` every edit to one matched `infra/**` and started a full Terraform plan (and approval gates) for a change that touches no infrastructure. Run them as `bash scripts/<name>.sh`.
+
+Why it matters:
+
+- Fewer pipeline executions, so fewer GitHub Actions minutes used and a quieter Actions tab where every run means something.
+- No needless image builds, ACR pushes or new Container App revisions for a docs change.
+- No approval requests for production deploys or infra applies that would change nothing.
+
+If you do need to redeploy without touching app code (for example to re-run a failed deploy), use "Re-run all jobs" on the earlier run in the Actions tab.
 
 ---
 
@@ -240,12 +261,12 @@ This replaces the manual `az` commands in sections 2-3 with Terraform resources 
 
 ### Create the Terraform State backend first
 
-Terraform's state file has to live somewhere both you and, later, CI can reach, not on a laptop disk. The standard pattern on Azure is a storage account with blob storage as the backend, which also gives you locking for free via blob leasing 
+Terraform's state file has to live somewhere both you and, later, CI can reach. The standard pattern on Azure is a storage account with blob storage as the backend, which also gives you locking for free via blob leasing 
 
-To setup state, run infra/bootstrap-state.sh and copy the values echo'd out into backend.hcl file (copied from backedn.hcl.example)
+To setup state, run scripts/bootstrap-state.sh and copy the values echo'd out into backend.hcl file (copied from backedn.hcl.example)
 
 ```bash
-bash infra/bootstrap-state.sh
+bash scripts/bootstrap-state.sh
 ```
 Storage account names are globally unique and alphanumeric only, same constraint as ACR. This state storage account sits outside the resource group Terraform itself manages, deliberately, so a `terraform destroy` of the app infrastructure can never touch its own state backend.
 
@@ -257,11 +278,11 @@ The infrastructure is split into two layers, each with its own directory and its
 
 | Layer | Directory | State key | What it owns |
 |---|---|---|---|
-| Platform | `infra/platform` | `aca-practice-platform.tfstate` | Resource group `rg-inspire-app1`, ACR `acrinspireapp1`, Log Analytics workspace, Container Apps Environment. Provisioned once, shared |
+| Platform | `infra/platform` | `aca-practice-platform.tfstate` | Resource group `rg-inspire-app1`, ACR `acrinspireapp1`, Log Analytics workspace, Container Apps Environment. |
 | Environment (staging) | `infra/environment` | `aca-practice-staging.tfstate` | Container App `aca-app-staging`, its identity and its AcrPull role assignment, its Key Vault and the identity's read access to it |
-| Environment (production) | `infra/environment` | `aca-practice-production.tfstate` | Container App `aca-app-production`, its identity and its AcrPull role assignment, its Key Vault and the identity's read access to it |
+| Environment (production) | `infra/environment` | `aca-practice-production.tfstate` | Container App `aca-app-production` |
 
-The environment layer is one set of Terraform files applied twice, once with `environment=staging` and once with `environment=production`. Both Container Apps run inside the one shared Container Apps Environment. The environment layer finds the platform resources by name, so the platform layer has to be applied first.
+The environment layer is one set of Terraform files applied twice, once with `environment=staging` and once with `environment=production` (both set in `.github/workflows/terraform-plan.yml` and `.github/workflows/terraform-apply.yml`)  Both Container Apps run inside the one shared Container Apps Environment. The environment layer finds the platform resources by name, so the platform layer has to be applied first.
 
 The word "environment" means three different things in this project, keep them apart:
 
@@ -269,7 +290,7 @@ The word "environment" means three different things in this project, keep them a
 - the Container Apps Environment is the Azure resource both Container Apps run inside (platform layer)
 - a GitHub Environment (`infra-apply`, `infra-apply-production`, `app-deploy-production`) is only an approval gate in GitHub, the names are deliberately not `staging` / `production` so they can't be mistaken for the Terraform variable
 
-### Run Terraform commands locally to plan
+### To test, run Terraform commands locally to plan
 
 `backend.hcl` holds the storage account details but no `key`, because each layer has its own state file. Pass the key at init:
 
@@ -290,14 +311,14 @@ terraform plan -var="environment=staging"
 
 For production, init again with `-reconfigure` and `key=aca-practice-production.tfstate`, then plan with `-var="environment=production"`. Always re-init before switching between staging and production, the state key and the variable have to match.
 
-# If those plans look right, you've proven the whole local loop end to end, and you're ready to open a PR and watch the plan workflow do the same thing in CI.
+If those plans look right, you've proven the whole local loop end to end, and you're ready to open a PR and watch the plan workflow do the same thing in CI.
 
 ### Setup OIDC for Terraform - same principle as OIDC for the deploy
 
-To create the OIDC run setup-terraform-oidc.sh
+To create the OIDC for Terraform to use, run scripts/setup-terraform-oidc.sh
 
 ```bash
-bash infra/setup-terraform-oidc.sh
+bash scripts/setup-terraform-oidc.sh
 ```
 
 Neither OIDC script needs running again for the staging / production split, the app registrations and their federated credentials are unchanged. What does need redoing after the platform and the Container Apps are first created (or recreated) is the role assignments on them, because those are scoped to the resources themselves:
@@ -323,10 +344,10 @@ Check the two display names match your app registrations first (`az ad app list 
 
 ### Setup the GitHub Environments used as approval gates
 
-These three environments, and the branch protection on `main`, are set up by a script rather than by hand in the GitHub website, so the script is the source of truth and re-running it puts any manual UI change back:
+These three environments, and the branch protection on `main`, are set up by a script:
 
 ```bash
-bash infra/setup-github-protection.sh
+bash scripts/setup-github-protection.sh
 ```
 
 | GitHub Environment | Gates | Required reviewers | Admins can bypass | Deployment branches |
@@ -335,7 +356,7 @@ bash infra/setup-github-protection.sh
 | `infra-apply-production` | applying the production environment layer | yes | no | Selected branches, `main` only |
 | `app-deploy-production` | deploying the app to `aca-app-production` | yes | no | Selected branches, `main` only |
 
-"Admins can bypass" is off so the reviewer and branch rule apply to the repo owner too, otherwise the owner could skip the gate. Prevent self-review is left off because there is only one reviewer. The script also sets `main`'s branch protection: the `plan` status check (see below) must pass before merging.
+"Admins can bypass" is off so the reviewer and branch rule apply to the repo owner too, otherwise the owner could skip the gate. Prevent self-review is left off because there could be only one reviewer. The script also sets `main`'s branch protection: the `plan` status check (see below) must pass before merging.
 
 To check the live settings against this, use the VERIFY commands at the bottom of the script.
 
@@ -367,7 +388,7 @@ The approval jobs (`approve-production` in both workflows) are separate jobs tha
 An end to end example of the usual pattern: a script puts a secret value into Azure Key Vault, and the running app reads it with its managed identity, with no password or key stored anywhere in the code, the image, the environment variables or the Terraform state.
 
 ```
-set-keyvault-secret.sh --> Key Vault (one per environment) <-- core/keyvault.py <-- GET /secret/
+scripts/set-keyvault-secret.sh --> Key Vault (one per environment) <-- core/keyvault.py <-- GET /secret/
    you, via az login        secret value, versioned           app's managed identity
 ```
 
@@ -377,15 +398,15 @@ set-keyvault-secret.sh --> Key Vault (one per environment) <-- core/keyvault.py 
 |---|---|
 | The vault, the app identity's read-only role on it, and audit logging | `infra/environment/keyvault.tf` |
 | The vault's address, the secret's name and the identity's client ID passed to the app as environment variables (none of them is secret) | `infra/environment/main.tf` |
-| The script that asks for the value and stores it | `infra/set-keyvault-secret.sh` |
+| The script that asks for the value and stores it | `scripts/set-keyvault-secret.sh` |
 | The code that reads it, with caching | `core/keyvault.py` |
 | The page that prints it | `show_secret` in `core/urls.py`, at `/secret/` |
 
 **Run order.** The first time:
 
-1. Re-run `bash infra/setup-terraform-oidc.sh`. It is safe to re-run, it skips what already exists and adds the one missing grant, User Access Administrator on the resource group, which Terraform needs to create the app identity's role assignment on the vault.
+1. Re-run `bash scripts/setup-terraform-oidc.sh`. It is safe to re-run, it skips what already exists and adds the one missing grant, User Access Administrator on the resource group, which Terraform needs to create the app identity's role assignment on the vault.
 2. Merge this change so `terraform-apply.yml` creates the vaults and gives the apps their `KEY_VAULT_*` environment variables. Approve the production apply.
-3. Store a value: `bash infra/set-keyvault-secret.sh staging` (then `production` when ready). Use a dummy value.
+3. Store a value: `bash scripts/set-keyvault-secret.sh staging` (then `production` when ready). Use a dummy value.
 4. The app deploy from the same merge ships the code. Visit `https://<app fqdn>/secret/` (the FQDN is in `terraform output container_app_fqdn`) and it prints the value.
 
 Role assignments can take a few minutes to reach the vault. If the page shows "Could not read the secret", wait a little and check the container logs (`az containerapp logs show -n aca-app-staging -g rg-inspire-app1`).
