@@ -141,7 +141,7 @@ check you are logged in to the right azure subscription
 ```bash
 az account show
 ```
-if you arent then just login again
+if you aren't, then just login again
 ```bash
 az login
 ```
@@ -222,6 +222,7 @@ Once the infrastructure is built by Terraform (section 7) there are two Containe
 
 ## 6. Verify the CI pipeline ran
 
+check the response from the live URL
 ```bash
 curl -I https://$(az containerapp show --name aca-practice-app --resource-group rg-aca-practice \
   --query properties.configuration.ingress.fqdn -o tsv)
