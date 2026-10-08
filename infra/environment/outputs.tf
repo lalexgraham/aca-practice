@@ -3,7 +3,8 @@ output "container_app_name" {
 }
 
 output "container_app_fqdn" {
-  value = azurerm_container_app.this.latest_revision_fqdn
+  description = "Stable ingress FQDN of the Container App. Not latest_revision_fqdn, which changes on every deploy and showed up as drift in every plan."
+  value       = azurerm_container_app.this.ingress[0].fqdn
 }
 
 output "container_app_identity_client_id" {

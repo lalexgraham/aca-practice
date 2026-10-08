@@ -29,7 +29,7 @@ resource "azurerm_key_vault" "this" {
   # including an admin, from permanently deleting a vault or secret inside
   # that window. It can't be switched off once on, and it means a destroyed
   # vault's name is locked for 90 days, so it's production only; staging can
-  # be destroyed and rebuilt freely (README section 9).
+  # be destroyed and rebuilt freely (docs/RUNBOOK.md section 9).
   soft_delete_retention_days = 90
   purge_protection_enabled   = var.environment == "production"
 
