@@ -3,6 +3,7 @@
 # Vault, for the Django app to read at /secret/ (core/keyvault.py).
 #
 # Usage: bash scripts/set-keyvault-secret.sh <staging|production>
+# Run it from the repo root. It prompts for the value so it never lands in shell history.
 #
 # The vault itself is created by Terraform (infra/environment/keyvault.tf);
 # this script only writes the secret VALUE, deliberately outside Terraform so
