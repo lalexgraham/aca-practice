@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def home(request):
-    return HttpResponse("Hello from Azure Container Apps, pipeline test 2")
+    return HttpResponse("Hello from Azure Container Apps")
 
 def show_secret(request):
     # DEMO ONLY: this prints a secret to anyone who can reach the URL, which
