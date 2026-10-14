@@ -521,6 +521,8 @@ A plain Bicep deployment keeps no state file: it just tells Azure "make these re
 | `aca-app-staging` / `aca-app-production` | the same names, in `rg-inspire-bcp` |
 | `kv-inspireapp1-<env>-<md5>` | `kv-inspirebcp-<env>-<uniqueString>` |
 
+The Bicep stack is in **UK West**, not UK South like the Terraform one: the subscription allows one Container Apps environment per region, and the Terraform stack already has UK South's. A deployment into UK South fails with `MaxNumberOfRegionalEnvironmentsInSubExceeded`, which `what-if` doesn't catch.
+
 `deploy.yml` only deploys to the Terraform stack. The Bicep apps keep running the placeholder hello-world image.
 
 ### How the Bicep is laid out
@@ -556,7 +558,7 @@ How the Terraform translates:
 ```bash
 az bicep lint --file infra/bicep/environment/main.bicep
 
-az deployment sub what-if --location uksouth \
+az deployment sub what-if --location ukwest \
   -f infra/bicep/platform/main.bicep -p infra/bicep/platform/main.bicepparam
 
 az deployment group what-if -g rg-inspire-bcp \
