@@ -9,3 +9,4 @@ infra/backend.hcl
 infra/.terraform/
 infra/*/.terraform/
 infra/*/tfplan
+infra/bicep/*/out/

@@ -15,7 +15,8 @@ name: Terraform apply
 on:
   push:
     branches: [main]
-    paths: ["infra/**"]
+    # infra/bicep is the separate Bicep stack, handled by bicep-apply.yml.
+    paths: ["infra/**", "!infra/bicep/**"]
 
 permissions:
   id-token: write

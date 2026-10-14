@@ -25,7 +25,7 @@
 set -euo pipefail
 
 # --- edit these if your names differ ---
-RESOURCE_GROUP="rg-inspire-app1"
+RESOURCE_GROUP="${RESOURCE_GROUP:-rg-inspire-app1}"  # RESOURCE_GROUP=rg-inspire-bcp for the Bicep stack
 SECRET_NAME="demo-secret"     # must match var.key_vault_secret_name
 EXPIRY_DAYS=90
 # ---------------------------------------

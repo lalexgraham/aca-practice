@@ -29,7 +29,9 @@
 #      each environment's AcrPull role assignment
 #      (azurerm_role_assignment.acr_pull in environment/main.tf). Skipped
 #      with a reminder if the ACR doesn't exist yet, which it won't until
-#      the platform layer's first terraform apply.
+#      the platform layer's first terraform apply. Also grants it on the
+#      Bicep stack's resource group (rg-inspire-bcp), for the Bicep
+#      workflows, which log in as this same identity.
 #
 # Safe to re-run: it reuses the app registration and service principal if
 # they exist, only creates federated credentials and role assignments that
@@ -51,6 +53,7 @@ TFSTATE_SA="tfstate19271"
 PROJECT="inspire-app1"                    # must match var.project default
 APP_RG="rg-${PROJECT}"                    # platform layer's resource group
 ACR_NAME="acr${PROJECT//-/}"
+BICEP_APP_RG="rg-inspire-bcp"             # the Bicep stack's group (infra/bicep, project "inspire-bcp")
 
 # -------------------------
 
@@ -182,6 +185,18 @@ else
   echo "   az role assignment create --assignee-object-id $SP_OBJECT_ID --assignee-principal-type ServicePrincipal --role \"User Access Administrator\" --scope \"\$(az group show -n $APP_RG --query id -o tsv)\""
 fi
 
+# The Bicep workflows (bicep-plan.yml, bicep-apply.yml) log in as this same
+# identity, so need no credentials of their own. Their stack lives in its
+# own resource group, and creates the same two kinds of role assignment
+# (AcrPull, Key Vault Secrets User) inside it, so needs the same grant there.
+echo "Granting User Access Administrator on the Bicep stack's resource group..."
+
+if BICEP_RG_ID=$(az group show -n "$BICEP_APP_RG" --query id -o tsv 2>/dev/null); then
+  ensure_role "User Access Administrator" "$BICEP_RG_ID"
+else
+  echo "   Resource group ${BICEP_APP_RG} doesn't exist yet. Re-run this script after bicep-apply.yml's first apply-platform."
+fi
+
 echo ""
 echo "Done."
 
@@ -214,6 +229,12 @@ echo "Done."
 #   --assignee "$APP_ID" \
 #   --role "User Access Administrator" \
 #   --scope "$(az group show -n rg-inspire-app1 --query id -o tsv)"
+
+# # same for the Bicep stack's resource group, if it still exists
+# az role assignment delete \
+#   --assignee "$APP_ID" \
+#   --role "User Access Administrator" \
+#   --scope "$(az group show -n rg-inspire-bcp --query id -o tsv)"
 
 # # this removes the app registration, its service principal, and all three
 # # federated credentials in one go

@@ -10,8 +10,9 @@
 #      "Selected branches and tags".
 #   2. Ensures each of those environments has exactly one deployment branch
 #      rule, `main` (a branch rule, not a tag rule).
-#   3. Sets branch protection on main: the `plan` status check
-#      (terraform-plan.yml's final job) must pass before merging.
+#   3. Sets branch protection on main: the `plan` and `bicep-plan` status
+#      checks (the final jobs of terraform-plan.yml and bicep-plan.yml) must
+#      pass before merging.
 #
 # Safe to re-run: the environment PUT and the branch protection PUT are both
 # declarative (they replace the whole setting), and branch rules are only
@@ -28,7 +29,7 @@ REPO_NAME="aca-practice"
 REVIEWER="lalexgraham"
 ENVIRONMENTS=("infra-apply" "infra-apply-production" "app-deploy-production")
 PROTECTED_BRANCH="main"
-REQUIRED_CHECK="plan"
+REQUIRED_CHECKS=("plan" "bicep-plan")
 # --------------------------------------------
 
 REPO="${GITHUB_USERNAME}/${REPO_NAME}"
@@ -89,10 +90,12 @@ done
 #     owner you can still merge past a failing check in an emergency. Flip
 #     to true to close that.
 #   - no required PR reviews: sole-developer repo
-echo "Configuring branch protection on ${PROTECTED_BRANCH} (required check: ${REQUIRED_CHECK})"
+echo "Configuring branch protection on ${PROTECTED_BRANCH} (required checks: ${REQUIRED_CHECKS[*]})"
+CONTEXTS_JSON=$(printf '"%s",' "${REQUIRED_CHECKS[@]}")
+CONTEXTS_JSON="[${CONTEXTS_JSON%,}]"
 gh api --method PUT "repos/${REPO}/branches/${PROTECTED_BRANCH}/protection" --input - >/dev/null <<EOF
 {
-  "required_status_checks": {"strict": false, "contexts": ["${REQUIRED_CHECK}"]},
+  "required_status_checks": {"strict": false, "contexts": ${CONTEXTS_JSON}},
   "enforce_admins": false,
   "required_pull_request_reviews": null,
   "restrictions": null,
