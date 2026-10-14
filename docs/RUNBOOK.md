@@ -35,6 +35,7 @@ If any of that isn't set up yet, refer to Appendix A (macOS/zsh install notes).
 7. Terraform: converting the manual build to IaC  - now we have a working example, we will beuild the same infrastructure in Azure but using Terraform
 8. Azure Cleanup for steps 2-3 (Azure CLI commands) 
 9. Azure Cleanup for Terraform
+10. Bicep: the same infrastructure again, as a parallel stack, with its own plan and apply workflows (a proof of concept for comparing the two tools)
 
  
 ---
@@ -500,6 +501,110 @@ The two Entra app registrations for, `github-aca-practice-deploy` (deploy) and
 `github-aca-practice-terraform` (infra), and their federated credentials
 aren't in Terraform state and aren't in either resource group. Leave them
 as-is for a retest, no reason to redo the OIDC setup each cycle.
+
+---
+
+## 10. Bicep: the same infrastructure as a parallel stack (POC)
+## Prerequisites: Bicep CLI (`az bicep install`)
+
+`infra/bicep/` builds the same two layers as the Terraform in `infra/platform` and `infra/environment`, and `bicep-plan.yml` / `bicep-apply.yml` run it with the same flow and approval gates as the Terraform workflows. Each layer is deployed as an Azure **deployment stack**, so removing a resource from the Bicep deletes it from Azure, as it does in Terraform. It exists to compare the two tools side by side.
+
+### Why a separate stack, not the same resources
+
+A plain Bicep deployment keeps no state file: it just tells Azure "make these resources look like this". If Bicep and Terraform both described `rg-inspire-app1`, each deploy would overwrite the other's changes, and each tool would report the other's changes as drift. So the Bicep stack has its own names, from `project = "inspire-bcp"`:
+
+| Terraform stack | Bicep stack |
+|---|---|
+| `rg-inspire-app1` | `rg-inspire-bcp` |
+| `acrinspireapp1` | `acrinspirebcp` |
+| `log-` / `cae-inspire-app1` | `log-` / `cae-inspire-bcp` |
+| `aca-app-staging` / `aca-app-production` | the same names, in `rg-inspire-bcp` |
+| `kv-inspireapp1-<env>-<md5>` | `kv-inspirebcp-<env>-<uniqueString>` |
+
+`deploy.yml` only deploys to the Terraform stack. The Bicep apps keep running the placeholder hello-world image.
+
+### How the Bicep is laid out
+
+```
+infra/bicep/
+  bicepconfig.json           linter rules, CI fails on the ones set to "error"
+  platform/
+    main.bicep               subscription scope: creates the resource group, then calls...
+    platform.bicep           ...the ACR, Log Analytics workspace and Container Apps Environment
+    main.bicepparam          project and location
+  environment/
+    main.bicep               identity, AcrPull, Key Vault + audit, Container App (main.tf + keyvault.tf)
+    staging.bicepparam
+    production.bicepparam
+```
+
+How the Terraform translates:
+
+| Terraform | Bicep |
+|---|---|
+| `data "azurerm_..."` lookups | `existing` resources |
+| a separate state file per layer/environment | a deployment stack per layer/environment (`bicep-platform`, `bicep-staging`, `bicep-production`). Azure keeps the list of resources each one manages, there is no backend to set up |
+| `terraform plan` | `az deployment sub what-if` / `az deployment group what-if`, plus `infra/bicep/stack-deletions.sh` for deletions, which what-if doesn't show |
+| `terraform apply` | `az stack sub create` / `az stack group create` |
+| `terraform destroy` | `az stack group delete` / `az stack sub delete` |
+| `lifecycle { ignore_changes = [image] }` | no equivalent. The workflows look up the image the app is running (`az containerapp show`) and pass it in as `containerImage`, so a deploy never resets it |
+| `purge_protection_enabled = false` | the property left unset. Azure refuses an explicit `false` |
+| a resource removed from the code is destroyed | the same: the stack deletes it (`--action-on-unmanage deleteResources`). Resource groups are only detached, never deleted |
+
+### Running it locally
+
+```bash
+az bicep lint --file infra/bicep/environment/main.bicep
+
+az deployment sub what-if --location uksouth \
+  -f infra/bicep/platform/main.bicep -p infra/bicep/platform/main.bicepparam
+
+az deployment group what-if -g rg-inspire-bcp \
+  -f infra/bicep/environment/main.bicep -p infra/bicep/environment/staging.bicepparam
+```
+
+### OIDC: no new identity
+
+The Bicep workflows log in as the Terraform identity (`AZURE_CLIENT_ID_TERRAFORM`). Its federated credentials match on repo and trigger (`pull_request`, push to `main`, the `infra-apply` environment), not on the workflow file, so they cover the Bicep workflows as they are. The jobs are laid out the same way as the Terraform ones, so each one gets an OIDC subject that already has a credential. The approval gates are the same GitHub Environments, `infra-apply` and `infra-apply-production`.
+
+The one extra permission is User Access Administrator on `rg-inspire-bcp`, for the two role assignments the environment layer creates. `scripts/setup-terraform-oidc.sh` grants it, once the group exists.
+
+### The workflows
+
+`bicep-plan.yml` runs on every pull request. It previews only the Bicep layers the PR changed, posts each what-if as a PR comment, and reports a `bicep-plan` check, which `setup-github-protection.sh` makes required alongside `plan`.
+
+`bicep-apply.yml` runs on a push to main touching `infra/bicep/**`, in the same order as `terraform-apply.yml`: platform (gate: `infra-apply`), then staging and production previewed together, staging applied, approval on `infra-apply-production`, production applied. `terraform-apply.yml` ignores `infra/bicep/**`, so a Bicep-only change doesn't start a Terraform run.
+
+**Stacks and deletions.** A stack remembers what it deployed, so a resource missing from the next template is deleted. `what-if` doesn't preview that, so `infra/bicep/stack-deletions.sh` compares the stack's managed resources with the resources the template resolves to, and lists the difference. `bicep-plan.yml` shows it in each PR comment, and `bicep-apply.yml` counts it as a change so the approval gate runs. Check that list before approving: a typo in a resource name looks like "delete the old one, create a new one".
+
+Each stack only touches what it deployed, so staging, production and the platform sit side by side in `rg-inspire-bcp` without deleting each other's resources.
+
+**The big difference from Terraform: there's no plan file.** Each what-if job compiles its layer to ARM JSON, previews that, and uploads it, and the apply job deploys exactly those files. That pins *what* is deployed. It doesn't pin the Azure state the preview was made against. Terraform refuses a saved plan if the state has moved on. A Bicep production apply made days after its preview is worked out again against Azure as it is then, and runs anyway.
+
+What-if can also show a `Modify` for properties Azure fills in itself, which would make an apply run with nothing to do. If a no-change re-run of `bicep-apply.yml` doesn't skip every apply, that's what to look for in the what-if job's log.
+
+### First run
+
+1. Merge the change that adds `infra/bicep`. `apply-platform` (after approval) creates `rg-inspire-bcp`. The PR's own environment previews say the group doesn't exist yet, which is expected.
+2. `apply-staging` fails on its role assignments: the identity can't grant roles in the new group yet.
+3. Run `bash scripts/setup-terraform-oidc.sh` again, which grants User Access Administrator on `rg-inspire-bcp`, then re-run the failed jobs.
+4. Run `bash scripts/setup-github-protection.sh` to make `bicep-plan` a required check.
+
+To store a Key Vault secret in the Bicep stack: `RESOURCE_GROUP=rg-inspire-bcp bash scripts/set-keyvault-secret.sh staging`.
+
+### Cleanup
+
+Delete the stacks in the reverse order to the build, environments first. `deleteAll` also deletes the resources each stack manages:
+
+```bash
+az stack group delete --name bicep-production -g rg-inspire-bcp --action-on-unmanage deleteAll --yes
+az stack group delete --name bicep-staging -g rg-inspire-bcp --action-on-unmanage deleteAll --yes
+az stack sub delete --name bicep-platform --action-on-unmanage deleteAll --yes
+```
+
+The last command deletes the resource group itself. If a stack gets stuck, `az group delete --name rg-inspire-bcp --yes --no-wait` removes everything in one go.
+
+The Key Vaults behave as in section 9: staging's sits soft-deleted (purge it with `az keyvault purge --name <vault>` to reuse the name straight away), production's has purge protection and its name stays reserved for 90 days.
 
 ---
 

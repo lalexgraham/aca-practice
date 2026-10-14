@@ -1,6 +1,6 @@
 # aca-practice
 
-A small Django app deployed to Azure Container Apps through GitHub Actions, with Azure authenticated by OIDC (no stored credentials) and the infrastructure managed by Terraform. It is a personal practice project; the full step-by-step build is in the [runbook](docs/RUNBOOK.md).
+A small Django app deployed to Azure Container Apps through GitHub Actions, with Azure authenticated by OIDC (no stored credentials) and the infrastructure managed by Terraform. The same infrastructure is also built a second time in Bicep, as a separate stack, to compare the two tools. It is a personal practice project; the full step-by-step build is in the [runbook](docs/RUNBOOK.md).
 
 ## What's in the repo
 
@@ -9,6 +9,7 @@ A small Django app deployed to Azure Container Apps through GitHub Actions, with
 | `core/`, `manage.py`, `Dockerfile` | The Django app and its container image |
 | `infra/platform/` | Terraform: resource group, ACR, Log Analytics, Container Apps Environment |
 | `infra/environment/` | Terraform: one Container App, identity and Key Vault, applied once for `staging` and once for `production` |
+| `infra/bicep/` | Bicep: the same two layers as a parallel stack in `rg-inspire-bcp` ([runbook section 10](docs/RUNBOOK.md#10-bicep-the-same-infrastructure-as-a-parallel-stack-poc)) |
 | `scripts/` | One-off setup scripts you run by hand (OIDC, state backend, GitHub protection, Key Vault secret) |
 | `.github/workflows/` | The pipelines |
 | `docs/RUNBOOK.md` | The full build guide, from a local app to Terraform and approval gates |
@@ -18,7 +19,9 @@ A small Django app deployed to Azure Container Apps through GitHub Actions, with
 | Workflow | Runs when | What it does |
 |---|---|---|
 | `terraform-plan.yml` | A pull request is opened or updated | Plans only the Terraform layers the PR changed and comments the plan. Applies nothing. Its `plan` check is required to merge into `main`. |
-| `terraform-apply.yml` | A push to `main` changes `infra/**` | Plans and applies the platform, then staging, then production (after approval) |
+| `terraform-apply.yml` | A push to `main` changes `infra/**` (except `infra/bicep/**`) | Plans and applies the platform, then staging, then production (after approval) |
+| `bicep-plan.yml` | A pull request is opened or updated | Runs `what-if` on the Bicep layers the PR changed and comments the result. That includes any resources it would delete. Its `bicep-plan` check is required to merge into `main`. |
+| `bicep-apply.yml` | A push to `main` changes `infra/bicep/**` | Deploys the Bicep platform, then staging, then production (after approval), as deployment stacks |
 | `deploy.yml` | A push to `main` changes `core/**`, `manage.py` or `Dockerfile` | Builds one image, deploys it to staging, then to production after approval |
 
 Changes to the README, `docs/` or `scripts/` start neither deploy nor apply, so they cost no pipeline runs.

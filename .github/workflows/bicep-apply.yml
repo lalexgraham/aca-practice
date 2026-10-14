@@ -1,0 +1,280 @@
+name: Bicep apply
+
+# The Bicep counterpart of terraform-apply.yml. Flow on a push to main
+# touching infra/bicep/**:
+#
+#   what-if-platform -> apply-platform (gate: infra-apply)
+#     -> what-if-environments (staging + production, previewed together, saved)
+#       -> apply-staging (no gate)
+#         -> approve-production (gate: infra-apply-production)
+#           -> apply-production (deploys the files saved above, no rebuild)
+#
+# Bicep has no plan file. The nearest equivalent used here: each what-if job
+# compiles its layer to ARM JSON (template + parameters, with the running
+# container image baked in), previews that, and uploads it. The apply job
+# deploys exactly those uploaded files. That pins WHAT is deployed, but
+# unlike a saved tfplan it doesn't pin the Azure state it was previewed
+# against: a production apply days later is recomputed against live state,
+# and won't refuse to run as stale the way `terraform apply tfplan` does.
+#
+# Layers are deployed as deployment stacks (`az stack ...`), not plain
+# deployments, so a resource removed from the Bicep is DELETED from Azure on
+# the next apply, as with Terraform (--action-on-unmanage deleteResources;
+# resource groups are only detached, never deleted). Stacks have no what-if
+# of their own, so each what-if job also lists the resources the stack would
+# delete (stack-deletions.sh) and counts them as a change, so the approval
+# gate shows them.
+#
+# A layer whose what-if shows no changes and no deletions skips its apply
+# (and its approval).
+#
+# Same identity, GitHub Environments and OIDC subjects as terraform-apply.yml:
+# apply-platform's `environment: infra-apply` uses the
+# github-tf-apply-env-infra-apply credential, every other job that logs in
+# uses the push-to-main one, and approve-production never logs in.
+
+on:
+  push:
+    branches: [main]
+    paths: ["infra/bicep/**"]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  BICEP_VERSION: "v0.48.1" # keep in step with bicep-plan.yml
+  BICEP_RG: rg-inspire-bcp # rg-<project>, project is set in the .bicepparam files
+  BICEP_LOCATION: uksouth # subscription-scope stacks need a location to store the stack in
+  AZURE_CORE_NO_COLOR: "true"
+
+jobs:
+  what-if-platform:
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.what-if.outputs.has_changes }}
+    defaults:
+      run:
+        working-directory: infra/bicep/platform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep CLI
+        run: |
+          az config set bicep.use_binary_from_path=false --only-show-errors
+          az bicep install --version "$BICEP_VERSION"
+
+      - name: Compile
+        run: |
+          mkdir -p out
+          az bicep build --file main.bicep --outfile out/main.json
+          az bicep build-params --file main.bicepparam --outfile out/params.json
+
+      - id: what-if
+        run: |
+          az deployment sub what-if --name bicep-platform --location "$BICEP_LOCATION" \
+            --template-file out/main.json --parameters out/params.json \
+            --no-pretty-print > whatif.json
+
+          # Stand-in for -detailed-exitcode: any change type other than
+          # NoChange/Ignore counts. Deploy and Unsupported (what-if couldn't
+          # predict the result) count too, to err on the side of applying.
+          jq -r '.changes[] | "\(.changeType)\t\(.resourceId)"' whatif.json
+          count=$(jq '[.changes[] | select(.changeType != "NoChange" and .changeType != "Ignore")] | length' whatif.json)
+
+          # Resources the stack would delete: what-if doesn't show these.
+          bash ../stack-deletions.sh sub bicep-platform whatif.json > deletions.txt
+          deletions=$(wc -l < deletions.txt | tr -d ' ')
+          if [ "$deletions" -gt 0 ]; then
+            echo "::warning::bicep-platform would DELETE $deletions resource(s):"
+            sed 's/^/Delete\t/' deletions.txt
+          fi
+
+          if [ "$count" -gt 0 ] || [ "$deletions" -gt 0 ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bicep-platform
+          path: infra/bicep/platform/out/
+          if-no-files-found: error
+          overwrite: true # lets "Re-run all jobs" replace the files from an earlier attempt
+
+  apply-platform:
+    needs: what-if-platform
+    if: needs.what-if-platform.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    environment: infra-apply
+    concurrency: bicep-platform
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Already compiled ARM JSON, so no checkout and no Bicep CLI needed.
+      - uses: actions/download-artifact@v4
+        with:
+          name: bicep-platform
+          path: out
+
+      - run: |
+          az stack sub create --name bicep-platform --location "$BICEP_LOCATION" \
+            --template-file out/main.json --parameters out/params.json \
+            --action-on-unmanage deleteResources --deny-settings-mode none \
+            --yes --query outputs
+
+  # Staging and production are previewed side by side, from the same commit,
+  # after the platform is up to date. The production files saved here are
+  # the ones apply-production deploys after approval.
+  what-if-environments:
+    needs: [what-if-platform, apply-platform]
+    # apply-platform is skipped when the platform has no changes; still run.
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        environment: [staging, production]
+    outputs:
+      # Each matrix leg only sets the output named after its own environment.
+      staging: ${{ steps.what-if.outputs.staging }}
+      production: ${{ steps.what-if.outputs.production }}
+    defaults:
+      run:
+        working-directory: infra/bicep/environment
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep CLI
+        run: |
+          az config set bicep.use_binary_from_path=false --only-show-errors
+          az bicep install --version "$BICEP_VERSION"
+
+      - name: Compile
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          mkdir -p out
+          az bicep build --file main.bicep --outfile out/main.json
+          az bicep build-params --file "$ENVIRONMENT.bicepparam" --outfile out/params.json
+
+          # Bicep's stand-in for Terraform's ignore_changes on the image:
+          # deploy whatever image the app is running now. Left at the
+          # template's placeholder default when the app doesn't exist yet.
+          image=$(az containerapp show -n "aca-app-$ENVIRONMENT" -g "$BICEP_RG" \
+            --query "properties.template.containers[0].image" -o tsv 2>/dev/null || true)
+          if [ -n "$image" ]; then
+            echo "Keeping running image: $image"
+            jq --arg img "$image" '.parameters.containerImage = {value: $img}' out/params.json > out/params.tmp
+            mv out/params.tmp out/params.json
+          fi
+
+      - id: what-if
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          az deployment group what-if --name "bicep-$ENVIRONMENT" --resource-group "$BICEP_RG" \
+            --template-file out/main.json --parameters out/params.json \
+            --no-pretty-print > whatif.json
+
+          jq -r '.changes[] | "\(.changeType)\t\(.resourceId)"' whatif.json
+          count=$(jq '[.changes[] | select(.changeType != "NoChange" and .changeType != "Ignore")] | length' whatif.json)
+
+          bash ../stack-deletions.sh group "bicep-$ENVIRONMENT" whatif.json "$BICEP_RG" > deletions.txt
+          deletions=$(wc -l < deletions.txt | tr -d ' ')
+          if [ "$deletions" -gt 0 ]; then
+            echo "::warning::bicep-$ENVIRONMENT would DELETE $deletions resource(s):"
+            sed 's/^/Delete\t/' deletions.txt
+          fi
+
+          if [ "$count" -gt 0 ] || [ "$deletions" -gt 0 ]; then
+            echo "$ENVIRONMENT=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$ENVIRONMENT=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bicep-${{ matrix.environment }}
+          path: infra/bicep/environment/out/
+          if-no-files-found: error
+          overwrite: true # lets "Re-run all jobs" replace the files from an earlier attempt
+
+  apply-staging:
+    needs: what-if-environments
+    if: ${{ !failure() && !cancelled() && needs.what-if-environments.outputs.staging == 'true' }}
+    runs-on: ubuntu-latest
+    concurrency: bicep-staging
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bicep-staging
+          path: out
+
+      - run: |
+          az stack group create --name bicep-staging --resource-group "$BICEP_RG" \
+            --template-file out/main.json --parameters out/params.json \
+            --action-on-unmanage deleteResources --deny-settings-mode none \
+            --yes --query outputs
+
+  # Approval gate only, kept separate from apply-production for the same
+  # OIDC reason as in terraform-apply.yml: a job with `environment:` gets an
+  # environment:<name> subject that no federated credential covers.
+  approve-production:
+    needs: [what-if-environments, apply-staging]
+    # Runs after staging succeeded, or was skipped for having no changes.
+    # Never runs if staging failed.
+    if: ${{ !failure() && !cancelled() && needs.what-if-environments.outputs.production == 'true' }}
+    runs-on: ubuntu-latest
+    environment: infra-apply-production
+    steps:
+      - run: echo "Production Bicep deploy approved for ${{ github.sha }}"
+
+  apply-production:
+    needs: [what-if-environments, approve-production]
+    if: ${{ !failure() && !cancelled() && needs.approve-production.result == 'success' }}
+    runs-on: ubuntu-latest
+    concurrency: bicep-production
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_TERRAFORM }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # The files saved by what-if-environments before the gate. See the
+      # header: this is the same template, not a guarantee the result is
+      # still what that what-if showed.
+      - uses: actions/download-artifact@v4
+        with:
+          name: bicep-production
+          path: out
+
+      - run: |
+          az stack group create --name bicep-production --resource-group "$BICEP_RG" \
+            --template-file out/main.json --parameters out/params.json \
+            --action-on-unmanage deleteResources --deny-settings-mode none \
+            --yes --query outputs

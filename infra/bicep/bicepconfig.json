@@ -1,0 +1,19 @@
+{
+  // Picked up by every .bicep file under infra/bicep. CI runs `az bicep lint`,
+  // which fails on any rule set to "error" here.
+  "analyzers": {
+    "core": {
+      "enabled": true,
+      "rules": {
+        "no-unused-params": { "level": "error" },
+        "no-unused-vars": { "level": "error" },
+        "no-unused-existing-resources": { "level": "error" },
+        "no-hardcoded-location": { "level": "error" },
+        "secure-secrets-in-params": { "level": "error" },
+        "outputs-should-not-contain-secrets": { "level": "error" },
+        "use-resource-symbol-reference": { "level": "error" },
+        "use-stable-resource-identifiers": { "level": "error" }
+      }
+    }
+  }
+}
