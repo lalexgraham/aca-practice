@@ -33,7 +33,7 @@ permissions:
 env:
   BICEP_VERSION: "v0.48.1" # keep in step with bicep-apply.yml
   BICEP_RG: rg-inspire-bcp # rg-<project>, project is set in the .bicepparam files
-  BICEP_LOCATION: uksouth # subscription-scope deployments need a location for their metadata
+  BICEP_LOCATION: ukwest # subscription-scope deployments need a location for their metadata
   AZURE_CORE_NO_COLOR: "true" # keep ANSI colour codes out of the PR comments
 
 jobs:
