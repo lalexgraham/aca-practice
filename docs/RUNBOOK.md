@@ -36,6 +36,7 @@ If any of that isn't set up yet, refer to Appendix A (macOS/zsh install notes).
 8. Azure Cleanup for steps 2-3 (Azure CLI commands) 
 9. Azure Cleanup for Terraform
 10. Bicep: the same infrastructure again, as a parallel stack, with its own plan and apply workflows (a proof of concept for comparing the two tools)
+11. Session log, 2026-10-21: tearing down Terraform and running the app on the Bicep stack, with what is still open
 
  
 ---
@@ -607,6 +608,134 @@ az stack sub delete --name bicep-platform --action-on-unmanage deleteAll --yes
 The last command deletes the resource group itself. If a stack gets stuck, `az group delete --name rg-inspire-bcp --yes --no-wait` removes everything in one go.
 
 The Key Vaults behave as in section 9: staging's sits soft-deleted (purge it with `az keyvault purge --name <vault>` to reuse the name straight away), production's has purge protection and its name stays reserved for 90 days.
+
+---
+
+## 11. Session log, 2026-10-21: swapping Terraform for Bicep
+
+A record of moving the running app from the Terraform stack to the Bicep stack, with the commands used and what is still open. Section 9 and section 10 hold the reference versions of the teardown and the Bicep layout.
+
+### Why the swap was needed
+
+The subscription allows **one Container Apps environment in total** (`MaxNumberOfGlobalEnvironmentsInSubExceeded`), and behind it one per region (`MaxNumberOfRegionalEnvironmentsInSubExceeded`). Terraform's `cae-inspire-app1` held the slot, so the Bicep platform layer failed at preflight, in UK South and again in UK West. `what-if` doesn't run that check, so the PR previews passed. Raising the limit needs a support request, which needs a paid (pay-as-you-go) subscription, so the Terraform stack was destroyed to free the slot instead.
+
+To find the inner error when a stack deployment fails (the Actions log only shows the outer one):
+
+```bash
+az deployment sub list --query "[?contains(name,'bicep')].{n:name,s:properties.provisioningState}" -o table
+az deployment operation sub list -n <failed-deployment-name> \
+  --query "[?properties.provisioningState=='Failed'].properties.statusMessage" -o json
+```
+
+### 1. Tear down Terraform
+
+Environments first, then the platform (section 9 has the detail):
+
+```bash
+cd infra/environment
+terraform init -reconfigure -backend-config=../backend.hcl -backend-config="key=aca-practice-production.tfstate"
+terraform destroy -var="environment=production"
+terraform init -reconfigure -backend-config=../backend.hcl -backend-config="key=aca-practice-staging.tfstate"
+terraform destroy -var="environment=staging"
+
+cd ../platform
+terraform init -reconfigure -backend-config=../backend.hcl -backend-config="key=aca-practice-platform.tfstate"
+terraform destroy
+```
+
+Deleting the Container Apps environment is slow: it sat in `ScheduledForDelete` for 15 minutes or more while Terraform polled. That is Azure, not a hang. Don't kill the run; check it from another terminal:
+
+```bash
+az containerapp env list -o table      # empty once the environment is gone
+az group exists -n rg-inspire-app1     # false once the whole group is gone
+```
+
+The Terraform state container, both Entra app registrations and their federated credentials were left alone.
+
+### 2. Pause the Terraform workflows
+
+```bash
+gh workflow disable "Terraform apply"
+gh workflow disable "Build and deploy to Azure Container Apps"   # re-enabled in step 4
+gh workflow list --all                                           # confirm
+```
+
+`Terraform apply` stays disabled while Bicep holds the environment: any push touching `infra/**` outside `infra/bicep` would recreate Terraform's environment and fail Bicep on the quota. **`Terraform plan` stays enabled**, because `plan` is a required check on `main` and a disabled workflow never reports it.
+
+### 3. Build the Bicep platform and environments with the workflows
+
+```bash
+# the group the environment applies need a role grant on
+az group create --name rg-inspire-bcp --location ukwest --tags purpose=pipeline-test
+bash scripts/setup-terraform-oidc.sh           # grants User Access Administrator on rg-inspire-bcp
+
+gh run rerun <failed-bicep-apply-run-id>       # or "Re-run all jobs" in the Actions UI
+```
+
+Then approve `infra-apply` (platform), let staging apply on its own, and approve `infra-apply-production`. Without the first two commands the staging apply fails on its role assignments, because the group doesn't exist for the grant. Check the result:
+
+```bash
+az stack sub list -o table                          # bicep-platform
+az stack group list -g rg-inspire-bcp -o table      # bicep-staging, bicep-production
+az resource list -g rg-inspire-bcp -o table         # 9 resources
+```
+
+### 4. Point the app deploy at the Bicep stack
+
+PR #22 changed `ACR_NAME` to `acrinspirebcp` and `RESOURCE_GROUP` to `rg-inspire-bcp` in `.github/workflows/deploy.yml`, and the same two values in `scripts/setup-deploy-oidc.sh`. The deploy identity's roles on the old ACR and apps disappeared with them, so they have to be granted again on the new ones, after the Bicep apps exist:
+
+```bash
+bash scripts/setup-deploy-oidc.sh              # AcrPush on the ACR, Container Apps Contributor on both apps
+gh workflow enable "Build and deploy to Azure Container Apps"
+```
+
+Merging the `deploy.yml` change then built the image into the new ACR, deployed it to staging, and (after approval on `app-deploy-production`) to production.
+
+```bash
+az containerapp show -n aca-app-staging -g rg-inspire-bcp \
+  --query "{image:properties.template.containers[0].image,fqdn:properties.configuration.ingress.fqdn}" -o json
+curl -s -o /dev/null -w "%{http_code}\n" https://<staging fqdn>/      # 200
+```
+
+The Bicep workflows read the image each app is running and pass it back in, so a later `bicep-apply` doesn't reset what `deploy.yml` deployed. Don't run the two at the same time.
+
+**A portal message that looks like a failure but isn't:** "Failed to load ACR Registries: ... admin user is disabled" comes from the Azure portal's image picker. The registry has the admin account off on purpose (`adminUserEnabled: false`); the pipeline pushes with OIDC and the apps pull with their managed identity. Don't enable the admin user. Use `az containerapp show` to see the running image.
+
+### 5. Tear down Bicep (documented, not yet run)
+
+Delete the environment stacks first, then the platform stack, which also removes the resource group:
+
+```bash
+az stack group delete --name bicep-production -g rg-inspire-bcp --action-on-unmanage deleteAll --yes
+az stack group delete --name bicep-staging    -g rg-inspire-bcp --action-on-unmanage deleteAll --yes
+az stack sub delete   --name bicep-platform   --action-on-unmanage deleteAll --yes
+
+# optional: clear the deployment history
+for d in $(az deployment sub list --query "[?starts_with(name,'bicep-')].name" -o tsv); do
+  az deployment sub delete --name "$d"
+done
+
+# confirm
+az group exists -n rg-inspire-bcp           # false
+az stack sub list -o table                  # empty
+az containerapp env list -o table           # empty: the quota slot is free
+```
+
+The production Key Vault (`kv-inspirebcp-prod-dl45`) has purge protection, so deleting it only soft-deletes it and its name is reserved for 90 days. Redeploying the Bicep stack with the same project name in that window fails on the vault name: recover it (`az keyvault recover --name kv-inspirebcp-prod-dl45`) or change the project name in the `.bicepparam` files. Staging's vault can be purged straight away: `az keyvault purge --name kv-inspirebcp-stag-dl45`.
+
+### 6. What is still open
+
+- **The Bicep stack is still running** in `rg-inspire-bcp` (3 stacks, 9 resources). Teardown was deferred; step 5 is ready to run.
+- **`Terraform apply` is disabled.** `deploy.yml` is enabled and points at the Bicep stack.
+- **The Terraform stack no longer exists.** Its state is empty. Going back means tearing down Bicep first (the quota), then:
+  ```bash
+  gh workflow enable "Terraform apply"
+  ```
+  flipping `ACR_NAME`/`RESOURCE_GROUP` in `deploy.yml` and `setup-deploy-oidc.sh` back to `acrinspireapp1` / `rg-inspire-app1`, applying Terraform, and re-running `setup-terraform-oidc.sh` and `setup-deploy-oidc.sh` for the new resources.
+- **Quota increase.** Needs the subscription upgraded to pay-as-you-go. With the limit raised to 2, both stacks could run side by side again and the swap would not be needed. Ask for the global limit and the UK West limit.
+- **Branch protection.** `bicep-plan` is a required check only if `scripts/setup-github-protection.sh` has been run since the Bicep workflows were added. Check with the VERIFY block at the bottom of that script.
+- **Not yet checked:** a no-change re-run of `bicep-apply` should skip every apply. If it doesn't, look for `what-if` noise on the Container Apps. The deletion list from `infra/bicep/stack-deletions.sh` has also not been exercised against a real removal.
+- **Possible follow-up:** Azure now has a native `what-if` for deployment stacks (aka.ms/stackswhatifGA) that could replace `stack-deletions.sh`. It wasn't available in the local CLI (2.90.0), so check the syntax first.
 
 ---
 
