@@ -41,8 +41,8 @@ set -euo pipefail
 GITHUB_USERNAME="lalexgraham"
 REPO_NAME="aca-practice"
 APP_DISPLAY_NAME="github-aca-practice-deploy"
-RESOURCE_GROUP="rg-inspire-app1"
-ACR_NAME="acrinspireapp1"
+RESOURCE_GROUP="rg-inspire-bcp"
+ACR_NAME="acrinspirebcp"
 CONTAINER_APP_NAMES=("aca-app-staging" "aca-app-production")
 # -------------------------
 
