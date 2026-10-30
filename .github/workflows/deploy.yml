@@ -24,9 +24,9 @@ permissions:
   contents: read
 
 env:
-  ACR_NAME: acrinspirebcp
+  ACR_NAME: acrinspireapp1
   IMAGE_NAME: aca-practice
-  RESOURCE_GROUP: rg-inspire-bcp
+  RESOURCE_GROUP: rg-inspire-app1
   STAGING_CONTAINER_APP: aca-app-staging
   PRODUCTION_CONTAINER_APP: aca-app-production
 
