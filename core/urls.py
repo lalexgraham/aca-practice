@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def home(request):
-    return HttpResponse("Hello from Azure Container Apps")
+    return HttpResponse("Hello from Azure Container Apps. Today is a good day to deploy a Django app!", content_type="text/plain")
 
 def show_secret(request):
     # DEMO ONLY: this prints a secret to anyone who can reach the URL, which
