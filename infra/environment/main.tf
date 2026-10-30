@@ -5,6 +5,7 @@
 # The platform resources are looked up by name rather than created here, so
 # the platform layer (../platform) has to be applied first.
 
+
 data "azurerm_resource_group" "platform" {
   name = "rg-${var.project}"
 }
