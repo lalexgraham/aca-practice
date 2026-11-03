@@ -10,7 +10,7 @@ resource "azurerm_resource_group" "this" {
   name     = "rg-${var.project}"
   location = var.location
   tags = {
-    purpose = "pipeline-test"
+    purpose = "pipeline-demo"
   }
 }
 
