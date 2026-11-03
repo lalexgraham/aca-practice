@@ -86,18 +86,20 @@ done
 # top-level key is spelled out; null means "not enabled".
 #   - strict=false: the branch needn't be up to date with main to merge, only
 #     the check must pass
-#   - enforce_admins=false: matches the current live setting, so as repo
-#     owner you can still merge past a failing check in an emergency. Flip
-#     to true to close that.
-#   - no required PR reviews: sole-developer repo
+#   - enforce_admins=true: the rules apply to the repo owner too, so there's
+#     no pushing straight to main or merging past a failing check. To
+#     override in an emergency, remove the protection (see UNDO) and re-run
+#     this script afterwards.
+#   - PRs required, but zero approvals: sole-developer repo, and GitHub
+#     won't let you approve your own PR
 echo "Configuring branch protection on ${PROTECTED_BRANCH} (required checks: ${REQUIRED_CHECKS[*]})"
 CONTEXTS_JSON=$(printf '"%s",' "${REQUIRED_CHECKS[@]}")
 CONTEXTS_JSON="[${CONTEXTS_JSON%,}]"
 gh api --method PUT "repos/${REPO}/branches/${PROTECTED_BRANCH}/protection" --input - >/dev/null <<EOF
 {
   "required_status_checks": {"strict": false, "contexts": ${CONTEXTS_JSON}},
-  "enforce_admins": false,
-  "required_pull_request_reviews": null,
+  "enforce_admins": true,
+  "required_pull_request_reviews": {"required_approving_review_count": 0},
   "restrictions": null,
   "required_linear_history": false,
   "allow_force_pushes": false,
