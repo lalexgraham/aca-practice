@@ -34,9 +34,7 @@ name: Bicep apply
 # uses the push-to-main one, and approve-production never logs in.
 
 on:
-  push:
-    branches: [main]
-    paths: ["infra/bicep/**"]
+  workflow_dispatch:
 
 permissions:
   id-token: write
