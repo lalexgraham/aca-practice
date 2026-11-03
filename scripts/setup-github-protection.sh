@@ -10,8 +10,8 @@
 #      "Selected branches and tags".
 #   2. Ensures each of those environments has exactly one deployment branch
 #      rule, `main` (a branch rule, not a tag rule).
-#   3. Sets branch protection on main: the `plan` and `bicep-plan` status
-#      checks (the final jobs of terraform-plan.yml and bicep-plan.yml) must
+#   3. Sets branch protection on main: the `plan` status
+#      checks (the final jobs of terraform-plan.yml) must
 #      pass before merging.
 #
 # Safe to re-run: the environment PUT and the branch protection PUT are both
@@ -29,7 +29,7 @@ REPO_NAME="aca-practice"
 REVIEWER="lalexgraham"
 ENVIRONMENTS=("infra-apply" "infra-apply-production" "app-deploy-production")
 PROTECTED_BRANCH="main"
-REQUIRED_CHECKS=("plan" "bicep-plan")
+REQUIRED_CHECKS=("plan")
 # --------------------------------------------
 
 REPO="${GITHUB_USERNAME}/${REPO_NAME}"
