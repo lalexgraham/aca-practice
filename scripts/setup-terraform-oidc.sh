@@ -53,7 +53,7 @@ TFSTATE_SA="tfstate19271"
 PROJECT="inspire-app1"                    # must match var.project default
 APP_RG="rg-${PROJECT}"                    # platform layer's resource group
 ACR_NAME="acr${PROJECT//-/}"
-BICEP_APP_RG="rg-inspire-bcp"             # the Bicep stack's group (infra/bicep, project "inspire-bcp")
+BICEP_APP_RG="rg-inspire-app1"             # the Bicep stack's group (infra/bicep, project "inspire-bcp")
 
 # -------------------------
 
